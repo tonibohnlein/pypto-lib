@@ -15,8 +15,10 @@ import os
 import statistics
 from pathlib import Path
 
-import pypto.language as pl
 import torch
+from pypto import passes
+
+import pypto.language as pl
 
 from config import QWEN3_14B, QWEN3_14B_TILING
 from golden import TensorSpec, run_jit
@@ -436,6 +438,7 @@ def main() -> None:
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-l2-swimlane", action="store_true")
+    parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--dump-args", type=int, choices=[0, 1, 2, 3], default=0)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--force-l0-tile")
@@ -445,6 +448,9 @@ def main() -> None:
         os.environ["PYPTO_FORCE_L0_TILE"] = args.force_l0_tile
     else:
         os.environ.pop("PYPTO_FORCE_L0_TILE", None)
+
+    compile_cfg = {"dump_passes": args.dump_passes}
+    enable_l0c_double_buffer = bool(args.force_l0_tile and args.force_l0_tile.endswith(",1"))
 
     torch.manual_seed(2079)
     config_summary = {
@@ -457,24 +463,27 @@ def main() -> None:
         "page_size": PAGE_SIZE,
         "pages": PAGES,
         "expected_tasks": EXPECTED_TASKS[args.variant],
+        "l0c_double_buffer": enable_l0c_double_buffer,
     }
     print(f"[QK_CONFIG] {json.dumps(config_summary, sort_keys=True)}")
-    result = run_jit(
-        fn=VARIANTS[args.variant],
-        specs=build_specs(args.variant),
-        golden_fn=(lambda values: golden_qk(values, args.variant)) if args.check else None,
-        runtime_cfg={
-            "platform": args.platform,
-            "device_id": args.device,
-            "enable_l2_swimlane": args.enable_l2_swimlane,
-            "enable_dump_args": args.dump_args,
-        },
-        compile_only=args.compile_only or args.platform.endswith("sim"),
-        rtol=2e-2,
-        atol=2e-2,
-        compare_fn={"out": _qk_compare(args.variant)},
-        save_data=False,
-    )
+    with passes.PassContext([], enable_pypto_l0c_double_buffer=enable_l0c_double_buffer):
+        result = run_jit(
+            fn=VARIANTS[args.variant],
+            specs=build_specs(args.variant),
+            golden_fn=(lambda values: golden_qk(values, args.variant)) if args.check else None,
+            compile_cfg=compile_cfg,
+            runtime_cfg={
+                "platform": args.platform,
+                "device_id": args.device,
+                "enable_l2_swimlane": args.enable_l2_swimlane,
+                "enable_dump_args": args.dump_args,
+            },
+            compile_only=args.compile_only or args.platform.endswith("sim"),
+            rtol=2e-2,
+            atol=2e-2,
+            compare_fn={"out": _qk_compare(args.variant)},
+            save_data=False,
+        )
     if not result.passed:
         if result.error:
             print(result.error)
