@@ -25,6 +25,25 @@ from contract.registry import find_contract_for_model_config, get_contract
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _class_members(source: Path, class_name: str) -> set[str]:
+    """Return fields, properties, and methods declared by one class."""
+    tree = ast.parse(source.read_text())
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    return {
+        node.target.id
+        for node in class_node.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    } | {
+        node.name
+        for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
 def _tiny_model_config() -> SimpleNamespace:
     return SimpleNamespace(
         hidden_size=8,
@@ -55,6 +74,35 @@ def test_registry_resolves_explicit_qwen3_14b_contract() -> None:
     assert sorted(contract.kernels) == ["decode", "greedy_sample", "prefill"]
     assert contract.execution == {"prefill": ("prefill",), "decode": ("decode",)}
     assert contract.abi_fingerprint()
+
+
+@pytest.mark.parametrize(
+    "source_name",
+    [
+        "qwen3_14b_decode_ssn_draft.py",
+        "qwen3_14b_decode_tq_draft.py",
+        "qwen3_14b_prefill_tq_draft.py",
+    ],
+)
+def test_draft_config_accesses_reference_current_fields(source_name: str) -> None:
+    """Keep draft kernels aligned with shared dynamic and model config names."""
+    model_dir = _REPO_ROOT / "models" / "qwen3" / "14b"
+    known_members = {
+        "D": _class_members(model_dir / "config.py", "Qwen3DynamicDims"),
+        "M": _class_members(model_dir / "constants.py", "Qwen3Config"),
+    }
+    tree = ast.parse((model_dir / source_name).read_text())
+
+    unknown = sorted(
+        f"{node.value.id}.{node.attr}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in known_members
+        and node.attr not in known_members[node.value.id]
+    )
+
+    assert unknown == []
 
 
 def test_registry_matches_qwen3_14b_model_config() -> None:
