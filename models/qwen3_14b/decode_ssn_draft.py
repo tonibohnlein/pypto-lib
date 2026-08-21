@@ -52,7 +52,7 @@ from config import (
     QWEN3_14B as M,
 )
 
-BATCH = M.batch
+BATCH = M.batch_pad
 MAX_SEQ = M.max_seq
 NUM_HEADS = M.num_heads
 NUM_KV_HEADS = M.num_kv_heads

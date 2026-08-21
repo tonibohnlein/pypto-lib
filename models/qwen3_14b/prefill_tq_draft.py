@@ -36,7 +36,7 @@ from turboquant_kv import (
 # ---------------------------------------------------------------------------
 # Dynamic dims (prefill-specific)
 # ---------------------------------------------------------------------------
-USER_BATCH_DYN = D.user_batch
+USER_BATCH_DYN = D.batch
 BLOCK_TABLE_FLAT_DYN = D.block_table_flat
 LAYER_DYN = D.layer
 LAYER_HIDDEN_ROWS_DYN = D.layer_hidden_rows
@@ -45,7 +45,7 @@ PREFILL_TOKENS_DYN = pl.dynamic("PREFILL_TOKENS_DYN")
 QUANT_CACHE_ROWS_DYN = pl.dynamic("QUANT_CACHE_ROWS_DYN")
 LAYER_ROT_ROWS_DYN = pl.dynamic("LAYER_ROT_ROWS_DYN")
 
-BATCH = M.batch
+BATCH = M.batch_pad
 NUM_HEADS = M.num_heads
 NUM_KV_HEADS = M.num_kv_heads
 HEAD_DIM = M.head_dim
