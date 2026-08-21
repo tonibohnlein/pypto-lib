@@ -29,6 +29,8 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 CMP_TABLE_BLOCKS_DYN = pl.dynamic("CMP_TABLE_BLOCKS_DYN")
+ORI_ROWS_DYN = pl.dynamic("ORI_ROWS_DYN")
+RAW_ROWS_DYN = pl.dynamic("RAW_ROWS_DYN")
 
 # model config
 B = DECODE_BATCH // TP
@@ -105,6 +107,71 @@ if T % ATTENTION_PUBLISH_T_TILE != 0:
 
 
 @pl.jit.inline(auto_scope=False)
+def hca_gather_kv(
+    ori_kv_flat: pl.Tensor[[ORI_ROWS_DYN, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    raw_kv: pl.Tensor[[RAW_ROWS_DYN, HEAD_DIM], pl.BF16],
+    raw_valid: pl.Tensor[[T_DYN, WIN], pl.FP32],
+    cache_ready_dep: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Gather the production HCA sliding window into contiguous raw rows."""
+    t_dim = pl.tensor.dim(window_swa_indices, 0)
+    raw_gather_count = t_dim * GATHER_SEGMENTS
+    with pl.spmd(
+        raw_gather_count,
+        name_hint="hca_gather_kv",
+        deps=[cache_ready_dep],
+    ) as raw_gather_tid:
+        g_task = pl.tile.get_block_idx()
+        g_t = g_task // GATHER_SEGMENTS
+        g_seg = g_task - g_t * GATHER_SEGMENTS
+        g_wk0 = g_seg * GATHER_WINDOW_TILE
+        g_row0 = g_t * WIN
+        for g_sub in pl.range(GATHER_WINDOW_TILE // GATHER_RUN_TILE):
+            g_sk0 = g_wk0 + g_sub * GATHER_RUN_TILE
+            g_sdst = g_row0 + g_sk0
+            g_first = pl.read(window_swa_indices, [g_t, g_sk0])
+            g_run_matches = pl.cast(g_first >= 0, pl.INT32)
+            for g_dr in pl.unroll(GATHER_RUN_TILE):
+                g_slot_i32 = pl.read(window_swa_indices, [g_t, g_sk0 + g_dr])
+                g_run_matches = g_run_matches * pl.cast(
+                    g_slot_i32 == g_first + g_dr,
+                    pl.INT32,
+                )
+            if g_run_matches == 1:
+                g_run_src = pl.cast(g_first, pl.INDEX)
+                raw_kv[
+                    g_sdst : g_sdst + GATHER_RUN_TILE,
+                    0:HEAD_DIM,
+                ] = ori_kv_flat[
+                    g_run_src : g_run_src + GATHER_RUN_TILE,
+                    0:HEAD_DIM,
+                ]
+                for g_dr in pl.unroll(GATHER_RUN_TILE):
+                    pl.write(raw_valid, [g_t, g_sk0 + g_dr], 1.0)
+            else:
+                for g_dr in pl.range(GATHER_RUN_TILE):
+                    g_lane = g_sk0 + g_dr
+                    g_dst = g_row0 + g_lane
+                    g_slot_i32 = pl.read(window_swa_indices, [g_t, g_lane])
+                    if g_slot_i32 >= 0:
+                        g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                        raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = ori_kv_flat[
+                            g_slot : g_slot + 1,
+                            0:HEAD_DIM,
+                        ]
+                        pl.write(raw_valid, [g_t, g_lane], 1.0)
+                    else:
+                        raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full(
+                            [1, HEAD_DIM],
+                            dtype=pl.BF16,
+                            value=0.0,
+                        )
+                        pl.write(raw_valid, [g_t, g_lane], 0.0)
+    return raw_gather_tid
+
+
+@pl.jit.inline(auto_scope=False)
 def sparse_attn_hca(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -130,7 +197,6 @@ def sparse_attn_hca(
     q_flat = pl.reshape(q, [t_dim * H, HEAD_DIM])
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
     request_count = pl.tensor.dim(cmp_block_table, 0)
-    raw_gather_count = t_dim * GATHER_SEGMENTS
     raw_tile_count = t_dim * (WIN // RAW_K_TILE)
     stream_block_count = t_dim * (H // H_TILE)
     cmp_gather_count = request_count * cmp_work_count
@@ -155,43 +221,13 @@ def sparse_attn_hca(
         raw_kv = pl.create_tensor([t_dim * WIN, HEAD_DIM], dtype=pl.BF16)
         raw_kv_t = pl.create_tensor([raw_tile_count * HEAD_DIM, RAW_K_TILE], dtype=pl.BF16)
         raw_valid = pl.create_tensor([t_dim, WIN], dtype=pl.FP32)
-        with pl.spmd(raw_gather_count, name_hint="hca_gather_kv", deps=[cache_ready_dep]) as raw_gather_tid:
-            g_task = pl.tile.get_block_idx()
-            g_t = g_task // GATHER_SEGMENTS
-            g_seg = g_task - g_t * GATHER_SEGMENTS
-            g_wk0 = g_seg * GATHER_WINDOW_TILE
-            g_row0 = g_t * WIN
-            for g_sub in pl.range(GATHER_WINDOW_TILE // GATHER_RUN_TILE):
-                g_sk0 = g_wk0 + g_sub * GATHER_RUN_TILE
-                g_sdst = g_row0 + g_sk0
-                g_first = pl.read(window_swa_indices, [g_t, g_sk0])
-                g_run_matches = pl.cast(g_first >= 0, pl.INT32)
-                for g_dr in pl.unroll(GATHER_RUN_TILE):
-                    g_slot_i32 = pl.read(window_swa_indices, [g_t, g_sk0 + g_dr])
-                    g_run_matches = g_run_matches * pl.cast(g_slot_i32 == g_first + g_dr, pl.INT32)
-                if g_run_matches == 1:
-                    g_run_src = pl.cast(g_first, pl.INDEX)
-                    raw_kv[
-                        g_sdst : g_sdst + GATHER_RUN_TILE,
-                        0:HEAD_DIM,
-                    ] = ori_kv_flat[
-                        g_run_src : g_run_src + GATHER_RUN_TILE,
-                        0:HEAD_DIM,
-                    ]
-                    for g_dr in pl.unroll(GATHER_RUN_TILE):
-                        pl.write(raw_valid, [g_t, g_sk0 + g_dr], 1.0)
-                else:
-                    for g_dr in pl.range(GATHER_RUN_TILE):
-                        g_lane = g_sk0 + g_dr
-                        g_dst = g_row0 + g_lane
-                        g_slot_i32 = pl.read(window_swa_indices, [g_t, g_lane])
-                        if g_slot_i32 >= 0:
-                            g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                            raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0:HEAD_DIM]
-                            pl.write(raw_valid, [g_t, g_lane], 1.0)
-                        else:
-                            raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                            pl.write(raw_valid, [g_t, g_lane], 0.0)
+        raw_gather_tid = hca_gather_kv(
+            ori_kv_flat,
+            window_swa_indices,
+            raw_kv,
+            raw_valid,
+            cache_ready_dep,
+        )
 
         with pl.spmd(raw_tile_count, name_hint="hca_raw_transpose", deps=[raw_gather_tid]) as raw_transpose_tid:
             raw_tile = pl.tile.get_block_idx()
