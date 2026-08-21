@@ -623,6 +623,31 @@ def indexer_score_topk_forest(
 
 
 @pl.jit.inline
+def idx_qr_proj_dequant(
+    qr_acc_pad: pl.Tensor[[T_PAD, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT32],
+    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    qr_proj: pl.Tensor[[T_DYN, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+):
+    """Dequantize the indexer query-projection accumulator."""
+    bs = pl.tensor.dim(qr_scale, 0)
+    for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_dequant", allow_early_resolve=True):
+        o_base = ot * Q_OUT_TILE
+        wq_scale = pl.reshape(wq_b_scale[o_base : o_base + Q_OUT_TILE], [1, Q_OUT_TILE])
+        for dq_t0 in pl.range(0, bs, DEQUANT_T_TILE):
+            acc_fp32 = pl.cast(
+                qr_acc_pad[dq_t0 : dq_t0 + DEQUANT_T_TILE, o_base : o_base + Q_OUT_TILE],
+                target_type=pl.FP32,
+                mode="none",
+            )
+            qr_scale_tile = qr_scale[dq_t0 : dq_t0 + DEQUANT_T_TILE, :]
+            qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, qr_scale_tile), wq_scale)
+            qr_proj[dq_t0 : dq_t0 + DEQUANT_T_TILE, o_base : o_base + Q_OUT_TILE] = qr_dequant
+
+    return qr_proj
+
+
+@pl.jit.inline
 def indexer(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
@@ -678,16 +703,7 @@ def indexer(
                     qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
             qr_acc_pad[qr_r0 : qr_r0 + MM_ROW_TILE, o_base + ns : o_base + ns + MM_N_TILE] = qr_acc
     qr_proj = pl.create_tensor([bs, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
-    for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_dequant", allow_early_resolve=True):
-        o_base = ot * Q_OUT_TILE
-        wq_scale = pl.reshape(wq_b_scale[o_base : o_base + Q_OUT_TILE], [1, Q_OUT_TILE])
-        for dq_t0 in pl.range(0, bs, DEQUANT_T_TILE):
-            acc_fp32 = pl.cast(
-                qr_acc_pad[dq_t0 : dq_t0 + DEQUANT_T_TILE, o_base : o_base + Q_OUT_TILE],
-                target_type=pl.FP32, mode="none")
-            qr_scale_tile = qr_scale[dq_t0 : dq_t0 + DEQUANT_T_TILE, :]
-            qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, qr_scale_tile), wq_scale)
-            qr_proj[dq_t0 : dq_t0 + DEQUANT_T_TILE, o_base : o_base + Q_OUT_TILE] = qr_dequant
+    idx_qr_proj_dequant(qr_acc_pad, qr_scale, wq_b_scale, qr_proj)
 
     qr_proj_flat = pl.reshape(qr_proj, [bs_heads, IDX_HEAD_DIM])
     # BF16 q for the Hadamard matmul: nope half rounded from the FP32 dequant, rope

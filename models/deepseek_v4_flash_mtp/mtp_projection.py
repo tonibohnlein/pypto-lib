@@ -23,6 +23,8 @@ from config import (
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
+T_LINEAR_DYN = pl.dynamic("T_LINEAR_DYN")
+T_LINEAR_HC_DYN = pl.dynamic("T_LINEAR_HC_DYN")
 
 # model config
 D = M.hidden_size
@@ -43,24 +45,15 @@ QUANT_TILE = 1024
 
 
 @pl.jit.inline
-def mtp_projection(
-    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    prev_hidden_states: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+def mtp_hidden_norm_quant(
+    hidden_flat: pl.Tensor[[T_DYN, D], pl.BF16],
     enorm_w: pl.Tensor[[D], pl.FP32],
-    hnorm_w: pl.Tensor[[D], pl.FP32],
-    e_proj_w: pl.Tensor[[D, D], pl.INT8],
-    e_proj_w_scale: pl.Tensor[[D], pl.FP32],
     e_proj_smooth: pl.Tensor[[D], pl.FP32],
-    h_proj_w: pl.Tensor[[D, D], pl.INT8],
-    h_proj_w_scale: pl.Tensor[[D], pl.FP32],
-    h_proj_smooth: pl.Tensor[[D], pl.FP32],
-    hidden_states_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    hidden_i8: pl.Tensor[[T_LINEAR_DYN, D], pl.INT8],
+    hidden_scale_dq: pl.Tensor[[T_LINEAR_DYN, 1], pl.FP32],
 ):
-    t_dim = pl.tensor.dim(hidden_states, 0)
-    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
-    hidden_flat = pl.reshape(hidden_states, [t_dim, D])
-    hidden_i8 = pl.create_tensor([t_linear, D], dtype=pl.INT8)
-    hidden_scale_dq = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
+    """Normalize and quantize the hidden-state rows for the projection."""
+    t_dim = pl.tensor.dim(hidden_flat, 0)
     for hidden_idx in pl.spmd(t_dim // T_TILE, name_hint="mtp_hidden_norm_quant", allow_early_resolve=True):
         t0 = hidden_idx * T_TILE
         hidden_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
@@ -100,6 +93,72 @@ def mtp_projection(
             hidden_q_half = pl.cast(hidden_q_i32, target_type=pl.FP16, mode="round")
             hidden_q_i8 = pl.cast(hidden_q_half, target_type=pl.INT8, mode="trunc")
             hidden_i8[t0 : t0 + T_TILE, k0 : k0 + QUANT_TILE] = hidden_q_i8
+
+    return hidden_i8, hidden_scale_dq
+
+
+@pl.jit.inline
+def mtp_dequant(
+    hidden_acc_pad: pl.Tensor[[T_LINEAR_DYN, D], pl.INT32],
+    prev_acc_pad: pl.Tensor[[T_LINEAR_HC_DYN, D], pl.INT32],
+    hidden_scale_dq: pl.Tensor[[T_LINEAR_DYN, 1], pl.FP32],
+    prev_scale_dq: pl.Tensor[[HC_MULT, T_LINEAR_DYN], pl.FP32],
+    e_proj_w_scale: pl.Tensor[[D], pl.FP32],
+    h_proj_w_scale: pl.Tensor[[D], pl.FP32],
+    hidden_states_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+):
+    """Dequantize and combine the two projection accumulators."""
+    t_dim = pl.tensor.dim(hidden_states_out, 0)
+    t_linear = pl.tensor.dim(hidden_acc_pad, 0)
+    out_flat = pl.reshape(hidden_states_out, [t_dim, HC_DIM])
+    dequant_tasks = (t_linear // LINEAR_T_TILE) * (D // OUT_TILE)
+    for linear_idx in pl.spmd(dequant_tasks, name_hint="mtp_dequant"):
+        t0 = (linear_idx // (D // OUT_TILE)) * LINEAR_T_TILE
+        n0 = (linear_idx % (D // OUT_TILE)) * OUT_TILE
+        e_scale = pl.reshape(e_proj_w_scale[n0 : n0 + OUT_TILE], [1, OUT_TILE])
+        hidden_acc = hidden_acc_pad[t0 : t0 + LINEAR_T_TILE, n0 : n0 + OUT_TILE]
+        hidden_acc_f32 = pl.cast(hidden_acc, target_type=pl.FP32, mode="none")
+        hidden_deq_scaled = pl.row_expand_mul(hidden_acc_f32, hidden_scale_dq[t0 : t0 + LINEAR_T_TILE, 0:1])
+        hidden_deq = pl.col_expand_mul(hidden_deq_scaled, e_scale)
+        h_scale = pl.reshape(h_proj_w_scale[n0 : n0 + OUT_TILE], [1, OUT_TILE])
+        prev_row0 = t0 * HC_MULT
+        linear_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
+        for hc in pl.range(HC_MULT):
+            prev_out = hc * D + n0
+            prev_hc_row0 = prev_row0 + hc * LINEAR_T_TILE
+            prev_acc_i32 = prev_acc_pad[prev_hc_row0 : prev_hc_row0 + LINEAR_T_TILE, n0 : n0 + OUT_TILE]
+            prev_hc_acc = pl.cast(prev_acc_i32, target_type=pl.FP32, mode="none")
+            prev_hc_scale_row = prev_scale_dq[hc : hc + 1, t0 : t0 + LINEAR_T_TILE]
+            prev_hc_scale = pl.reshape(prev_hc_scale_row, [LINEAR_T_TILE, 1])
+            prev_hc_scaled = pl.row_expand_mul(prev_hc_acc, prev_hc_scale)
+            prev_hc = pl.col_expand_mul(prev_hc_scaled, h_scale)
+            acc = pl.add(hidden_deq, prev_hc)
+            acc_valid = pl.set_validshape(acc, linear_rows, OUT_TILE)
+            out_flat[t0 : t0 + LINEAR_T_TILE, prev_out : prev_out + OUT_TILE] = acc_valid
+
+    return pl.reshape(out_flat, [t_dim, HC_MULT, D])
+
+
+@pl.jit.inline
+def mtp_projection(
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    prev_hidden_states: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    enorm_w: pl.Tensor[[D], pl.FP32],
+    hnorm_w: pl.Tensor[[D], pl.FP32],
+    e_proj_w: pl.Tensor[[D, D], pl.INT8],
+    e_proj_w_scale: pl.Tensor[[D], pl.FP32],
+    e_proj_smooth: pl.Tensor[[D], pl.FP32],
+    h_proj_w: pl.Tensor[[D, D], pl.INT8],
+    h_proj_w_scale: pl.Tensor[[D], pl.FP32],
+    h_proj_smooth: pl.Tensor[[D], pl.FP32],
+    hidden_states_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+):
+    t_dim = pl.tensor.dim(hidden_states, 0)
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
+    hidden_flat = pl.reshape(hidden_states, [t_dim, D])
+    hidden_i8 = pl.create_tensor([t_linear, D], dtype=pl.INT8)
+    hidden_scale_dq = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
+    mtp_hidden_norm_quant(hidden_flat, enorm_w, e_proj_smooth, hidden_i8, hidden_scale_dq)
 
     t_linear_hc = t_linear * HC_MULT
     prev_flat = pl.reshape(prev_hidden_states, [t_dim, HC_DIM])
@@ -175,34 +234,15 @@ def mtp_projection(
             prev_cube_acc = pl.matmul_acc(prev_cube_acc, prev_a, h_w, b_trans=True)
         prev_acc_pad[prev_row0 : prev_row0 + LINEAR_HC_TILE, n0 : n0 + LINEAR_OUT_TILE] = prev_cube_acc
 
-    out_flat = pl.reshape(hidden_states_out, [t_dim, HC_DIM])
-    dequant_tasks = (t_linear // LINEAR_T_TILE) * (D // OUT_TILE)
-    for linear_idx in pl.spmd(dequant_tasks, name_hint="mtp_dequant"):
-        t0 = (linear_idx // (D // OUT_TILE)) * LINEAR_T_TILE
-        n0 = (linear_idx % (D // OUT_TILE)) * OUT_TILE
-        e_scale = pl.reshape(e_proj_w_scale[n0 : n0 + OUT_TILE], [1, OUT_TILE])
-        hidden_acc = hidden_acc_pad[t0 : t0 + LINEAR_T_TILE, n0 : n0 + OUT_TILE]
-        hidden_acc_f32 = pl.cast(hidden_acc, target_type=pl.FP32, mode="none")
-        hidden_deq_scaled = pl.row_expand_mul(hidden_acc_f32, hidden_scale_dq[t0 : t0 + LINEAR_T_TILE, 0:1])
-        hidden_deq = pl.col_expand_mul(hidden_deq_scaled, e_scale)
-        h_scale = pl.reshape(h_proj_w_scale[n0 : n0 + OUT_TILE], [1, OUT_TILE])
-        prev_row0 = t0 * HC_MULT
-        linear_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
-        for hc in pl.range(HC_MULT):
-            prev_out = hc * D + n0
-            prev_hc_row0 = prev_row0 + hc * LINEAR_T_TILE
-            prev_acc_i32 = prev_acc_pad[prev_hc_row0 : prev_hc_row0 + LINEAR_T_TILE, n0 : n0 + OUT_TILE]
-            prev_hc_acc = pl.cast(prev_acc_i32, target_type=pl.FP32, mode="none")
-            prev_hc_scale_row = prev_scale_dq[hc : hc + 1, t0 : t0 + LINEAR_T_TILE]
-            prev_hc_scale = pl.reshape(prev_hc_scale_row, [LINEAR_T_TILE, 1])
-            prev_hc_scaled = pl.row_expand_mul(prev_hc_acc, prev_hc_scale)
-            prev_hc = pl.col_expand_mul(prev_hc_scaled, h_scale)
-            acc = pl.add(hidden_deq, prev_hc)
-            acc_valid = pl.set_validshape(acc, linear_rows, OUT_TILE)
-            out_flat[t0 : t0 + LINEAR_T_TILE, prev_out : prev_out + OUT_TILE] = acc_valid
-
-    hidden_states_out = pl.reshape(out_flat, [t_dim, HC_MULT, D])
-    return hidden_states_out
+    return mtp_dequant(
+        hidden_acc_pad,
+        prev_acc_pad,
+        hidden_scale_dq,
+        prev_scale_dq,
+        e_proj_w_scale,
+        h_proj_w_scale,
+        hidden_states_out,
+    )
 
 
 @pl.jit
