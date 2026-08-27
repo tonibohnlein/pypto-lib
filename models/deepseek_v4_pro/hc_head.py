@@ -43,56 +43,15 @@ STAT_COLS = (HC_MULT + 1) * T_TILE
 
 
 @pl.jit.inline
-def hc_head(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
+def hc_head_reduce(
+    stats: pl.Tensor[[(T_MAX // T_TILE) * (HC_DIM // MIX_SPLIT_TILE), STAT_COLS], pl.FP32],
+    x_flat: pl.Tensor[[T_DYN, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
-    y: pl.Tensor[[T_DYN, D], pl.BF16],
+    y_flat: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
-    t_dim = pl.tensor.dim(x_hc, 0)
-    x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
-    stats = pl.create_tensor([(T_MAX // T_TILE) * (HC_DIM // MIX_SPLIT_TILE), STAT_COLS], dtype=pl.FP32)
-
-    for task in pl.spmd(
-        (t_dim // T_TILE) * (HC_DIM // MIX_SPLIT_TILE),
-        name_hint="hc_head_mix",
-    ):
-        tt = task // (HC_DIM // MIX_SPLIT_TILE)
-        split = task - tt * (HC_DIM // MIX_SPLIT_TILE)
-        t0 = tt * T_TILE
-        k_base = split * MIX_SPLIT_TILE
-        acc = pl.full([1, STAT_COLS], dtype=pl.FP32, value=0.0)
-        for k0 in pl.pipeline(k_base, k_base + MIX_SPLIT_TILE, MIX_K_TILE, stage=4):
-            x_chunk = x_flat[t0 : t0 + T_TILE, k0 : k0 + MIX_K_TILE]
-            w0 = hc_head_fn[0:1, k0 : k0 + MIX_K_TILE]
-            w1 = hc_head_fn[1:2, k0 : k0 + MIX_K_TILE]
-            w2 = hc_head_fn[2:3, k0 : k0 + MIX_K_TILE]
-            w3 = hc_head_fn[3:4, k0 : k0 + MIX_K_TILE]
-            x_sq = pl.mul(x_chunk, x_chunk)
-            x_sq_sum = pl.row_sum(x_sq)
-            x_sq_row = pl.reshape(x_sq_sum, [1, T_TILE])
-            mix0_weighted = pl.col_expand_mul(x_chunk, w0)
-            mix0_sum = pl.row_sum(mix0_weighted)
-            mix0_row = pl.reshape(mix0_sum, [1, T_TILE])
-            stats01 = pl.concat(x_sq_row, mix0_row)
-            mix1_weighted = pl.col_expand_mul(x_chunk, w1)
-            mix1_sum = pl.row_sum(mix1_weighted)
-            mix1_row = pl.reshape(mix1_sum, [1, T_TILE])
-            mix2_weighted = pl.col_expand_mul(x_chunk, w2)
-            mix2_sum = pl.row_sum(mix2_weighted)
-            mix2_row = pl.reshape(mix2_sum, [1, T_TILE])
-            stats12 = pl.concat(mix1_row, mix2_row)
-            mix3_weighted = pl.col_expand_mul(x_chunk, w3)
-            mix3_sum = pl.row_sum(mix3_weighted)
-            mix3_row = pl.reshape(mix3_sum, [1, T_TILE])
-            stats123 = pl.concat(stats12, mix3_row)
-            chunk_stats = pl.concat(stats01, stats123)
-            acc = pl.add(acc, chunk_stats)
-        stats_row = tt * (HC_DIM // MIX_SPLIT_TILE) + split
-        stats[stats_row : stats_row + 1, 0:STAT_COLS] = acc
-
-    y_flat = pl.reshape(y, [t_dim, D])
+    """Reduce split statistics and apply the Hyper-Connections head mix."""
+    t_dim = pl.tensor.dim(x_flat, 0)
     for task in pl.spmd((t_dim // T_TILE) * (D // D_SPLIT_TILE), name_hint="hc_head_reduce"):
         tt = task // (D // D_SPLIT_TILE)
         d_split = task - tt * (D // D_SPLIT_TILE)
@@ -164,7 +123,59 @@ def hc_head(
             y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
             y_flat[t0 : t0 + T_TILE, d0 : d0 + D_TILE] = y_bf16
 
-    y = pl.reshape(y_flat, [t_dim, D])
+
+@pl.jit.inline
+def hc_head(
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
+    hc_head_scale: pl.Tensor[[1], pl.FP32],
+    hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
+    y: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    t_dim = pl.tensor.dim(x_hc, 0)
+    x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
+    stats = pl.create_tensor([(T_MAX // T_TILE) * (HC_DIM // MIX_SPLIT_TILE), STAT_COLS], dtype=pl.FP32)
+
+    for task in pl.spmd(
+        (t_dim // T_TILE) * (HC_DIM // MIX_SPLIT_TILE),
+        name_hint="hc_head_mix",
+    ):
+        tt = task // (HC_DIM // MIX_SPLIT_TILE)
+        split = task - tt * (HC_DIM // MIX_SPLIT_TILE)
+        t0 = tt * T_TILE
+        k_base = split * MIX_SPLIT_TILE
+        acc = pl.full([1, STAT_COLS], dtype=pl.FP32, value=0.0)
+        for k0 in pl.pipeline(k_base, k_base + MIX_SPLIT_TILE, MIX_K_TILE, stage=4):
+            x_chunk = x_flat[t0 : t0 + T_TILE, k0 : k0 + MIX_K_TILE]
+            w0 = hc_head_fn[0:1, k0 : k0 + MIX_K_TILE]
+            w1 = hc_head_fn[1:2, k0 : k0 + MIX_K_TILE]
+            w2 = hc_head_fn[2:3, k0 : k0 + MIX_K_TILE]
+            w3 = hc_head_fn[3:4, k0 : k0 + MIX_K_TILE]
+            x_sq = pl.mul(x_chunk, x_chunk)
+            x_sq_sum = pl.row_sum(x_sq)
+            x_sq_row = pl.reshape(x_sq_sum, [1, T_TILE])
+            mix0_weighted = pl.col_expand_mul(x_chunk, w0)
+            mix0_sum = pl.row_sum(mix0_weighted)
+            mix0_row = pl.reshape(mix0_sum, [1, T_TILE])
+            stats01 = pl.concat(x_sq_row, mix0_row)
+            mix1_weighted = pl.col_expand_mul(x_chunk, w1)
+            mix1_sum = pl.row_sum(mix1_weighted)
+            mix1_row = pl.reshape(mix1_sum, [1, T_TILE])
+            mix2_weighted = pl.col_expand_mul(x_chunk, w2)
+            mix2_sum = pl.row_sum(mix2_weighted)
+            mix2_row = pl.reshape(mix2_sum, [1, T_TILE])
+            stats12 = pl.concat(mix1_row, mix2_row)
+            mix3_weighted = pl.col_expand_mul(x_chunk, w3)
+            mix3_sum = pl.row_sum(mix3_weighted)
+            mix3_row = pl.reshape(mix3_sum, [1, T_TILE])
+            stats123 = pl.concat(stats12, mix3_row)
+            chunk_stats = pl.concat(stats01, stats123)
+            acc = pl.add(acc, chunk_stats)
+        stats_row = tt * (HC_DIM // MIX_SPLIT_TILE) + split
+        stats[stats_row : stats_row + 1, 0:STAT_COLS] = acc
+
+    y_flat = pl.reshape(y, [t_dim, D])
+    hc_head_reduce(stats, x_flat, hc_head_scale, hc_head_base, y_flat)
     return y
 
 
@@ -192,11 +203,11 @@ def hc_head_stats_golden(x_flat_2d, hc_head_fn):
         sq_split = torch.zeros(rows, 1, dtype=torch.float32)
         mix_split = torch.zeros(rows, HC_MULT, dtype=torch.float32)
         for k0 in range(k_base, k_base + MIX_SPLIT_TILE, MIX_K_TILE):
-            x_chunk = x_flat_2d[:, k0:k0 + MIX_K_TILE]
+            x_chunk = x_flat_2d[:, k0 : k0 + MIX_K_TILE]
             sq_split += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
             for h in range(HC_MULT):
-                w_chunk = hc_head_fn[h:h + 1, k0:k0 + MIX_K_TILE]
-                mix_split[:, h:h + 1] += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
+                w_chunk = hc_head_fn[h : h + 1, k0 : k0 + MIX_K_TILE]
+                mix_split[:, h : h + 1] += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
         sq_sum += sq_split
         mixes += mix_split
     return sq_sum, mixes
@@ -217,17 +228,13 @@ def golden_hc_head(tensors):
     pre = torch.sigmoid(mixes * tensors["hc_head_scale"].float() + tensors["hc_head_base"].float()) + HC_EPS
     x_view = x.float().view(shape)
     if HC_MULT == 4:
-        y = (
-            x_view[:, 0, :] * pre[:, 0:1]
-            + x_view[:, 1, :] * pre[:, 1:2]
-        ) + (
-            x_view[:, 2, :] * pre[:, 2:3]
-            + x_view[:, 3, :] * pre[:, 3:4]
+        y = (x_view[:, 0, :] * pre[:, 0:1] + x_view[:, 1, :] * pre[:, 1:2]) + (
+            x_view[:, 2, :] * pre[:, 2:3] + x_view[:, 3, :] * pre[:, 3:4]
         )
     else:
         y = torch.zeros(T, D, dtype=torch.float32)
         for h in range(HC_MULT):
-            y += x_view[:, h, :] * pre[:, h:h + 1]
+            y += x_view[:, h, :] * pre[:, h : h + 1]
 
     tensors["y"][:] = y.to(torch.bfloat16)
 
@@ -247,7 +254,9 @@ def build_tensor_specs():
         TensorSpec("hc_head_fn", [HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
         TensorSpec("hc_head_scale", [1], torch.float32, init_value=lambda: torch.tensor([0.076099])),
         TensorSpec(
-            "hc_head_base", [HC_MULT], torch.float32,
+            "hc_head_base",
+            [HC_MULT],
+            torch.float32,
             init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124]),
         ),
         TensorSpec("y", [T, D], torch.bfloat16, is_output=True),
@@ -260,7 +269,9 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument(
+        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
+    )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
@@ -310,16 +321,12 @@ def golden_hc_head_rows(tensors):
     pre = torch.sigmoid(logits) + M.hc_eps
     x_view = x.float()
     if HC_MULT == 4:
-        y = (
-            x_view[:, 0, :] * pre[:, 0:1]
-            + x_view[:, 1, :] * pre[:, 1:2]
-        ) + (
-            x_view[:, 2, :] * pre[:, 2:3]
-            + x_view[:, 3, :] * pre[:, 3:4]
+        y = (x_view[:, 0, :] * pre[:, 0:1] + x_view[:, 1, :] * pre[:, 1:2]) + (
+            x_view[:, 2, :] * pre[:, 2:3] + x_view[:, 3, :] * pre[:, 3:4]
         )
     else:
         y = torch.zeros(rows, D, dtype=torch.float32)
         for h in range(HC_MULT):
-            y += x_view[:, h, :] * pre[:, h:h + 1]
+            y += x_view[:, h, :] * pre[:, h : h + 1]
 
     tensors["y"][:] = y.to(torch.bfloat16)

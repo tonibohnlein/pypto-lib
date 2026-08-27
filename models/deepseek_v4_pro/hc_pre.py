@@ -9,7 +9,6 @@
 # ci: no-dep-gen
 """DeepSeek-V4 Hyper-Connections pre-mix with syncall-fused and separate-task implementations."""
 
-
 import os
 
 import pypto.language as pl
@@ -19,6 +18,7 @@ from config import ACTIVE as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
+MIX_PARTIAL_ROWS_DYN = pl.dynamic("MIX_PARTIAL_ROWS_DYN")
 
 # model config
 D = M.hidden_size
@@ -106,10 +106,14 @@ def _hc_pre_syncall(
             for kb in pl.pipeline(0, LINEAR_K_SPLIT_TILE // LINEAR_K_TILE, stage=2):
                 k0 = k_base + kb * LINEAR_K_TILE
                 x_linear_chunk = pl.slice(
-                    x_flat, [LINEAR_T_TILE, LINEAR_K_TILE], [t0, k0],
+                    x_flat,
+                    [LINEAR_T_TILE, LINEAR_K_TILE],
+                    [t0, k0],
                     valid_shape=[t_rows, LINEAR_K_TILE],
                 )
-                w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[MIX_HC, LINEAR_K_TILE])
+                w_chunk = pl.slice(
+                    hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[MIX_HC, LINEAR_K_TILE]
+                )
                 if kb == 0:
                     acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
                 else:
@@ -124,7 +128,7 @@ def _hc_pre_syncall(
                 k_base = rms_split * RMS_K_SPLIT_TILE
                 sq_part = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
                 for k0 in pl.pipeline(k_base, k_base + RMS_K_SPLIT_TILE, RMS_K_TILE, stage=4):
-                    x_chunk = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_TILE]
+                    x_chunk = x_flat[t0 : t0 + T_TILE, k0 : k0 + RMS_K_TILE]
                     x_sq = pl.mul(x_chunk, x_chunk)
                     x_sq_sum = pl.row_sum(x_sq)
                     x_sq_row = pl.reshape(x_sq_sum, [1, T_TILE])
@@ -157,7 +161,7 @@ def _hc_pre_syncall(
             for gw in pl.range(lane, pool_d, NUM_CORES * 2):
                 if gw < tt_n:
                     t0 = gw * COMB_T_TILE
-                    ssq_row = sq_sum_acc[0:1, t0:t0 + COMB_T_TILE]
+                    ssq_row = sq_sum_acc[0:1, t0 : t0 + COMB_T_TILE]
                     ssq_mean = pl.mul(ssq_row, HC_DIM_INV)
                     ssq_eps = pl.add(ssq_mean, NORM_EPS)
                     inv_row = pl.rsqrt(ssq_eps, high_precision=True)
@@ -166,36 +170,60 @@ def _hc_pre_syncall(
                     inv_col_t = pl.load(inv_gm, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)
                     comb_off = HC_MULT * 2
                     mix_g0 = pl.load(
-                        mixes_raw, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD],
-                        valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                        mixes_raw,
+                        [t0, comb_off + 0 * HC_MULT],
+                        [COMB_T_TILE, HC_PAD],
+                        valid_shape=[COMB_T_TILE, HC_MULT],
+                        target_memory=pl.MemorySpace.Vec,
                     )
                     mix_g1 = pl.load(
-                        mixes_raw, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD],
-                        valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                        mixes_raw,
+                        [t0, comb_off + 1 * HC_MULT],
+                        [COMB_T_TILE, HC_PAD],
+                        valid_shape=[COMB_T_TILE, HC_MULT],
+                        target_memory=pl.MemorySpace.Vec,
                     )
                     mix_g2 = pl.load(
-                        mixes_raw, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD],
-                        valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                        mixes_raw,
+                        [t0, comb_off + 2 * HC_MULT],
+                        [COMB_T_TILE, HC_PAD],
+                        valid_shape=[COMB_T_TILE, HC_MULT],
+                        target_memory=pl.MemorySpace.Vec,
                     )
                     mix_g3 = pl.load(
-                        mixes_raw, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD],
-                        valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                        mixes_raw,
+                        [t0, comb_off + 3 * HC_MULT],
+                        [COMB_T_TILE, HC_PAD],
+                        valid_shape=[COMB_T_TILE, HC_MULT],
+                        target_memory=pl.MemorySpace.Vec,
                     )
                     cb0 = pl.load(
-                        hc_reshaped, [0, comb_off + 0 * HC_MULT], [1, HC_PAD],
-                        valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                        hc_reshaped,
+                        [0, comb_off + 0 * HC_MULT],
+                        [1, HC_PAD],
+                        valid_shape=[1, HC_MULT],
+                        target_memory=pl.MemorySpace.Vec,
                     )
                     cb1 = pl.load(
-                        hc_reshaped, [0, comb_off + 1 * HC_MULT], [1, HC_PAD],
-                        valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                        hc_reshaped,
+                        [0, comb_off + 1 * HC_MULT],
+                        [1, HC_PAD],
+                        valid_shape=[1, HC_MULT],
+                        target_memory=pl.MemorySpace.Vec,
                     )
                     cb2 = pl.load(
-                        hc_reshaped, [0, comb_off + 2 * HC_MULT], [1, HC_PAD],
-                        valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                        hc_reshaped,
+                        [0, comb_off + 2 * HC_MULT],
+                        [1, HC_PAD],
+                        valid_shape=[1, HC_MULT],
+                        target_memory=pl.MemorySpace.Vec,
                     )
                     cb3 = pl.load(
-                        hc_reshaped, [0, comb_off + 3 * HC_MULT], [1, HC_PAD],
-                        valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                        hc_reshaped,
+                        [0, comb_off + 3 * HC_MULT],
+                        [1, HC_PAD],
+                        valid_shape=[1, HC_MULT],
+                        target_memory=pl.MemorySpace.Vec,
                     )
                     row0_normed = pl.row_expand_mul(mix_g0, inv_col_t)
                     row0_scaled = pl.mul(row0_normed, scale2)
@@ -218,8 +246,12 @@ def _hc_pre_syncall(
                     row2_p = pl.fillpad(row2, pad_value=pl.PadValue.min)
                     row3_p = pl.fillpad(row3, pad_value=pl.PadValue.min)
 
-                    row_max_tmp = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-                    row_sum_tmp = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                    row_max_tmp = pl.create_tile(
+                        [COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                    )
+                    row_sum_tmp = pl.create_tile(
+                        [COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                    )
                     row0_max = pl.row_max(row0_p, row_max_tmp)
                     row1_max = pl.row_max(row1_p, row_max_tmp)
                     row2_max = pl.row_max(row2_p, row_max_tmp)
@@ -255,7 +287,8 @@ def _hc_pre_syncall(
                     row3_eff = pl.fillpad(row3_valid, pad_value=pl.PadValue.zero)
 
                     row_sum_tmp_iter = pl.create_tile(
-                        [COMB_T_TILE, HC_PAD], dtype=pl.FP32,
+                        [COMB_T_TILE, HC_PAD],
+                        dtype=pl.FP32,
                         target_memory=pl.MemorySpace.Vec,
                     )
                     row01_eff = pl.add(row0_eff, row1_eff)
@@ -302,13 +335,13 @@ def _hc_pre_syncall(
                     blk = gw - tt_n
                     t0 = (blk // (D // MIX_D_TILE)) * T_TILE
                     d_base = (blk % (D // MIX_D_TILE)) * MIX_D_TILE
-                    ssq_row = sq_sum_acc[0:1, t0:t0 + T_TILE]
+                    ssq_row = sq_sum_acc[0:1, t0 : t0 + T_TILE]
                     ssq_mean = pl.mul(ssq_row, HC_DIM_INV)
                     ssq_eps = pl.add(ssq_mean, NORM_EPS)
                     inv_row = pl.rsqrt(ssq_eps, high_precision=True)
                     inv_col = pl.reshape(inv_row, [T_TILE, 1])
                     pre_base = hc_reshaped[0:1, 0:HC_PAD]
-                    pre_normed = pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, 0:HC_PAD], inv_col)
+                    pre_normed = pl.row_expand_mul(mixes_raw[t0 : t0 + T_TILE, 0:HC_PAD], inv_col)
                     pre_scaled = pl.mul(pre_normed, scale0)
                     pre_base_tile = pl.col_expand(pre_scaled, pre_base)
                     pre_logits = pl.add(pre_scaled, pre_base_tile)
@@ -325,10 +358,10 @@ def _hc_pre_syncall(
                     pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
                     pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
                     for d0 in pl.pipeline(d_base, d_base + MIX_D_TILE, D_TILE, stage=2):
-                        x0 = x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_TILE]
-                        x1 = x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_TILE]
-                        x2 = x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_TILE]
-                        x3 = x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_TILE]
+                        x0 = x_flat[t0 : t0 + T_TILE, 0 * D + d0 : 0 * D + d0 + D_TILE]
+                        x1 = x_flat[t0 : t0 + T_TILE, 1 * D + d0 : 1 * D + d0 + D_TILE]
+                        x2 = x_flat[t0 : t0 + T_TILE, 2 * D + d0 : 2 * D + d0 + D_TILE]
+                        x3 = x_flat[t0 : t0 + T_TILE, 3 * D + d0 : 3 * D + d0 + D_TILE]
                         y0 = pl.row_expand_mul(x0, pre0)
                         y1 = pl.row_expand_mul(x1, pre1)
                         y2 = pl.row_expand_mul(x2, pre2)
@@ -342,13 +375,15 @@ def _hc_pre_syncall(
                 else:
                     ob = gw - tt_n - mixx_n
                     t0 = ob * COMB_T_TILE
-                    ssq_row = sq_sum_acc[0:1, t0:t0 + COMB_T_TILE]
+                    ssq_row = sq_sum_acc[0:1, t0 : t0 + COMB_T_TILE]
                     ssq_mean = pl.mul(ssq_row, HC_DIM_INV)
                     ssq_eps = pl.add(ssq_mean, NORM_EPS)
                     inv_row = pl.rsqrt(ssq_eps, high_precision=True)
                     inv_col = pl.reshape(inv_row, [COMB_T_TILE, 1])
-                    post_base = hc_reshaped[0:1, HC_MULT:HC_MULT + HC_PAD]
-                    post_normed = pl.row_expand_mul(mixes_raw[t0:t0 + COMB_T_TILE, HC_MULT:HC_MULT + HC_PAD], inv_col)
+                    post_base = hc_reshaped[0:1, HC_MULT : HC_MULT + HC_PAD]
+                    post_normed = pl.row_expand_mul(
+                        mixes_raw[t0 : t0 + COMB_T_TILE, HC_MULT : HC_MULT + HC_PAD], inv_col
+                    )
                     post_scaled = pl.mul(post_normed, scale1)
                     post_base_tile = pl.col_expand(post_scaled, post_base)
                     post_logits = pl.add(post_scaled, post_base_tile)
@@ -359,11 +394,67 @@ def _hc_pre_syncall(
                     post_pad = pl.mul(post_sigmoid, 2.0)
                     post_pad_store[t0 : t0 + COMB_T_TILE, 0:HC_PAD] = post_pad
                     post_tile = pl.load(
-                        post_pad_store, [t0, 0], [COMB_T_TILE, HC_PAD],
-                        valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                        post_pad_store,
+                        [t0, 0],
+                        [COMB_T_TILE, HC_PAD],
+                        valid_shape=[COMB_T_TILE, HC_MULT],
+                        target_memory=pl.MemorySpace.Vec,
                     )
                     pl.store(post_tile, [t0, 0], post)
     return x_mixed
+
+
+@pl.jit.inline
+def split_pre_post(
+    inv_rms: pl.Tensor[[T_DYN, 1], pl.FP32],
+    mixes_partials: pl.Tensor[[MIX_PARTIAL_ROWS_DYN, MIX_PAD], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    scale0: pl.Scalar[pl.FP32],
+    scale1: pl.Scalar[pl.FP32],
+    pre_val_store: pl.Tensor[[T_DYN, HC_PAD], pl.FP32],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+):
+    """Split the linear partials into the pre and post Hyper-Connections gates."""
+    t_dim = pl.tensor.dim(post, 0)
+    t_linear = pl.tensor.dim(mixes_partials, 0) // (HC_DIM // LINEAR_K_SPLIT_TILE)
+    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post"):
+        t0 = ob * T_TILE
+        inv_col = inv_rms[t0 : t0 + T_TILE, 0:1]
+        pre_mixes = mixes_partials[t0 : t0 + T_TILE, 0:HC_PAD]
+        post_mixes = mixes_partials[t0 : t0 + T_TILE, HC_MULT : HC_MULT + HC_PAD]
+        for linear_split in pl.unroll(1, HC_DIM // LINEAR_K_SPLIT_TILE):
+            p0 = linear_split * t_linear + t0
+            pre_mixes = pl.add(pre_mixes, mixes_partials[p0 : p0 + T_TILE, 0:HC_PAD])
+            post_mixes = pl.add(post_mixes, mixes_partials[p0 : p0 + T_TILE, HC_MULT : HC_MULT + HC_PAD])
+
+        pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
+        pre_normed = pl.row_expand_mul(pre_mixes, inv_col)
+        pre_scaled = pl.mul(pre_normed, scale0)
+        pre_base_tile = pl.col_expand(pre_scaled, pre_base)
+        pre_logits = pl.add(pre_scaled, pre_base_tile)
+        pre_neg = pl.neg(pre_logits)
+        pre_exp = pl.exp(pre_neg)
+        pre_denom = pl.add(pre_exp, 1.0)
+        pre_sig = pl.recip(pre_denom)
+        pre_val = pl.add(pre_sig, HC_EPS)
+        pre_val_store[t0 : t0 + T_TILE, 0:HC_PAD] = pre_val
+
+        post_base = pl.reshape(hc_base[HC_MULT : HC_MULT + HC_PAD], [1, HC_PAD])
+        post_normed = pl.row_expand_mul(post_mixes, inv_col)
+        post_scaled = pl.mul(post_normed, scale1)
+        post_base_tile = pl.col_expand(post_scaled, post_base)
+        post_logits = pl.add(post_scaled, post_base_tile)
+        post_neg = pl.neg(post_logits)
+        post_exp = pl.exp(post_neg)
+        post_denom = pl.add(post_exp, 1.0)
+        post_sig = pl.recip(post_denom)
+        post_pad = pl.mul(post_sig, 2.0)
+        post[t0 : t0 + T_TILE, 0:HC_MULT] = pl.slice(
+            post_pad,
+            [T_TILE, HC_PAD],
+            [0, 0],
+            valid_shape=[T_TILE, HC_MULT],
+        )
 
 
 @pl.jit.inline
@@ -389,7 +480,7 @@ def _hc_pre_separate(
         t0 = t * T_TILE
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.pipeline(0, HC_DIM, RMS_K_TILE, stage=4):
-            x_chunk = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_TILE]
+            x_chunk = x_flat[t0 : t0 + T_TILE, k0 : k0 + RMS_K_TILE]
             x_sq = pl.mul(x_chunk, x_chunk)
             x_sq_sum = pl.row_sum(x_sq)
             x_sq_row = pl.reshape(x_sq_sum, [1, T_TILE])
@@ -414,7 +505,9 @@ def _hc_pre_separate(
         for kb in pl.pipeline(0, LINEAR_K_SPLIT_TILE // LINEAR_K_TILE, stage=2):
             k0 = k_base + kb * LINEAR_K_TILE
             x_linear_chunk = pl.slice(
-                x_flat, [LINEAR_T_TILE, LINEAR_K_TILE], [t0, k0],
+                x_flat,
+                [LINEAR_T_TILE, LINEAR_K_TILE],
+                [t0, k0],
                 valid_shape=[t_rows, LINEAR_K_TILE],
             )
             w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[MIX_HC, LINEAR_K_TILE])
@@ -426,40 +519,7 @@ def _hc_pre_separate(
         mixes_partials[partial_t0 : partial_t0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post"):
-        t0 = ob * T_TILE
-        inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
-        pre_mixes = mixes_partials[t0:t0 + T_TILE, 0:HC_PAD]
-        post_mixes = mixes_partials[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD]
-        for linear_split in pl.unroll(1, HC_DIM // LINEAR_K_SPLIT_TILE):
-            p0 = linear_split * t_linear + t0
-            pre_mixes = pl.add(pre_mixes, mixes_partials[p0:p0 + T_TILE, 0:HC_PAD])
-            post_mixes = pl.add(post_mixes, mixes_partials[p0:p0 + T_TILE, HC_MULT:HC_MULT + HC_PAD])
-
-        pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
-        pre_normed = pl.row_expand_mul(pre_mixes, inv_col)
-        pre_scaled = pl.mul(pre_normed, scale0)
-        pre_base_tile = pl.col_expand(pre_scaled, pre_base)
-        pre_logits = pl.add(pre_scaled, pre_base_tile)
-        pre_neg = pl.neg(pre_logits)
-        pre_exp = pl.exp(pre_neg)
-        pre_denom = pl.add(pre_exp, 1.0)
-        pre_sig = pl.recip(pre_denom)
-        pre_val = pl.add(pre_sig, HC_EPS)
-        pre_val_store[t0 : t0 + T_TILE, 0:HC_PAD] = pre_val
-
-        post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
-        post_normed = pl.row_expand_mul(post_mixes, inv_col)
-        post_scaled = pl.mul(post_normed, scale1)
-        post_base_tile = pl.col_expand(post_scaled, post_base)
-        post_logits = pl.add(post_scaled, post_base_tile)
-        post_neg = pl.neg(post_logits)
-        post_exp = pl.exp(post_neg)
-        post_denom = pl.add(post_exp, 1.0)
-        post_sig = pl.recip(post_denom)
-        post_pad = pl.mul(post_sig, 2.0)
-        # HC_PAD supplies a 32-byte row while HC_MULT marks the valid output width.
-        post[t0:t0 + T_TILE, 0:HC_MULT] = pl.slice(post_pad, [T_TILE, HC_PAD], [0, 0], valid_shape=[T_TILE, HC_MULT])
+    split_pre_post(inv_rms, mixes_partials, hc_base, scale0, scale1, pre_val_store, post)
 
     hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])
     for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="comb_sinkhorn"):
@@ -467,58 +527,94 @@ def _hc_pre_separate(
         inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)
         comb_off = HC_MULT * 2
         mix_g0 = pl.load(
-            mixes_partials, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD],
-            valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+            mixes_partials,
+            [t0, comb_off + 0 * HC_MULT],
+            [COMB_T_TILE, HC_PAD],
+            valid_shape=[COMB_T_TILE, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
         )
         mix_g1 = pl.load(
-            mixes_partials, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD],
-            valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+            mixes_partials,
+            [t0, comb_off + 1 * HC_MULT],
+            [COMB_T_TILE, HC_PAD],
+            valid_shape=[COMB_T_TILE, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
         )
         mix_g2 = pl.load(
-            mixes_partials, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD],
-            valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+            mixes_partials,
+            [t0, comb_off + 2 * HC_MULT],
+            [COMB_T_TILE, HC_PAD],
+            valid_shape=[COMB_T_TILE, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
         )
         mix_g3 = pl.load(
-            mixes_partials, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD],
-            valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+            mixes_partials,
+            [t0, comb_off + 3 * HC_MULT],
+            [COMB_T_TILE, HC_PAD],
+            valid_shape=[COMB_T_TILE, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
         )
         for linear_split in pl.unroll(1, HC_DIM // LINEAR_K_SPLIT_TILE):
             p0 = linear_split * t_linear + t0
             partial_g0 = pl.load(
-                mixes_partials, [p0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD],
-                valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                mixes_partials,
+                [p0, comb_off + 0 * HC_MULT],
+                [COMB_T_TILE, HC_PAD],
+                valid_shape=[COMB_T_TILE, HC_MULT],
+                target_memory=pl.MemorySpace.Vec,
             )
             mix_g0 = pl.add(mix_g0, partial_g0)
             partial_g1 = pl.load(
-                mixes_partials, [p0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD],
-                valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                mixes_partials,
+                [p0, comb_off + 1 * HC_MULT],
+                [COMB_T_TILE, HC_PAD],
+                valid_shape=[COMB_T_TILE, HC_MULT],
+                target_memory=pl.MemorySpace.Vec,
             )
             mix_g1 = pl.add(mix_g1, partial_g1)
             partial_g2 = pl.load(
-                mixes_partials, [p0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD],
-                valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                mixes_partials,
+                [p0, comb_off + 2 * HC_MULT],
+                [COMB_T_TILE, HC_PAD],
+                valid_shape=[COMB_T_TILE, HC_MULT],
+                target_memory=pl.MemorySpace.Vec,
             )
             mix_g2 = pl.add(mix_g2, partial_g2)
             partial_g3 = pl.load(
-                mixes_partials, [p0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD],
-                valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec,
+                mixes_partials,
+                [p0, comb_off + 3 * HC_MULT],
+                [COMB_T_TILE, HC_PAD],
+                valid_shape=[COMB_T_TILE, HC_MULT],
+                target_memory=pl.MemorySpace.Vec,
             )
             mix_g3 = pl.add(mix_g3, partial_g3)
         cb0 = pl.load(
-            hc_base_2d, [0, comb_off + 0 * HC_MULT], [1, HC_PAD],
-            valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec,
+            hc_base_2d,
+            [0, comb_off + 0 * HC_MULT],
+            [1, HC_PAD],
+            valid_shape=[1, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
         )
         cb1 = pl.load(
-            hc_base_2d, [0, comb_off + 1 * HC_MULT], [1, HC_PAD],
-            valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec,
+            hc_base_2d,
+            [0, comb_off + 1 * HC_MULT],
+            [1, HC_PAD],
+            valid_shape=[1, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
         )
         cb2 = pl.load(
-            hc_base_2d, [0, comb_off + 2 * HC_MULT], [1, HC_PAD],
-            valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec,
+            hc_base_2d,
+            [0, comb_off + 2 * HC_MULT],
+            [1, HC_PAD],
+            valid_shape=[1, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
         )
         cb3 = pl.load(
-            hc_base_2d, [0, comb_off + 3 * HC_MULT], [1, HC_PAD],
-            valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec,
+            hc_base_2d,
+            [0, comb_off + 3 * HC_MULT],
+            [1, HC_PAD],
+            valid_shape=[1, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
         )
         row0_normed = pl.row_expand_mul(mix_g0, inv_col_t)
         row0_scaled = pl.mul(row0_normed, scale2)
@@ -577,7 +673,9 @@ def _hc_pre_separate(
         row2_eff = pl.fillpad(row2_valid, pad_value=pl.PadValue.zero)
         row3_eff = pl.fillpad(row3_valid, pad_value=pl.PadValue.zero)
 
-        row_sum_tmp_iter = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row_sum_tmp_iter = pl.create_tile(
+            [COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+        )
         row01_eff = pl.add(row0_eff, row1_eff)
         row23_eff = pl.add(row2_eff, row3_eff)
         col_sum_raw = pl.add(row01_eff, row23_eff)
@@ -621,16 +719,16 @@ def _hc_pre_separate(
     for blk in pl.spmd((t_dim // T_TILE) * (D // MIX_D_TILE), name_hint="mix_x"):
         t0 = (blk // (D // MIX_D_TILE)) * T_TILE
         d_base = (blk % (D // MIX_D_TILE)) * MIX_D_TILE
-        pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
+        pre_tile_t = pl.transpose(pre_val_store[t0 : t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
         pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
         pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
         pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
         pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
         for d0 in pl.pipeline(d_base, d_base + MIX_D_TILE, D_TILE, stage=2):
-            x0 = x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_TILE]
-            x1 = x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_TILE]
-            x2 = x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_TILE]
-            x3 = x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_TILE]
+            x0 = x_flat[t0 : t0 + T_TILE, 0 * D + d0 : 0 * D + d0 + D_TILE]
+            x1 = x_flat[t0 : t0 + T_TILE, 1 * D + d0 : 1 * D + d0 + D_TILE]
+            x2 = x_flat[t0 : t0 + T_TILE, 2 * D + d0 : 2 * D + d0 + D_TILE]
+            x3 = x_flat[t0 : t0 + T_TILE, 3 * D + d0 : 3 * D + d0 + D_TILE]
             y0 = pl.row_expand_mul(x0, pre0)
             y1 = pl.row_expand_mul(x1, pre1)
             y2 = pl.row_expand_mul(x2, pre2)
@@ -639,13 +737,14 @@ def _hc_pre_separate(
             y23 = pl.add(y2, y3)
             y_tile = pl.add(y01, y23)
             y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-            x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE] = y_bf16
+            x_mixed[t0 : t0 + T_TILE, d0 : d0 + D_TILE] = y_bf16
     return x_mixed
 
 
 def _bind_hc_pre():
     """Bind the public inline kernel for HC_PRE_IMPL."""
     if HC_PRE_IMPL == "separate":
+
         @pl.jit.inline
         def hc_pre(
             x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
@@ -659,6 +758,7 @@ def _bind_hc_pre():
             _hc_pre_separate(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
             return x_mixed
     else:
+
         @pl.jit.inline
         def hc_pre(
             x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
@@ -671,6 +771,7 @@ def _bind_hc_pre():
         ):
             _hc_pre_syncall(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
             return x_mixed
+
     return hc_pre
 
 
@@ -706,7 +807,9 @@ def _golden_a5_trowsum_fp32(values):
     if values.dtype != torch.float32:
         raise ValueError(f"A5 FP32 TROWSUM golden requires float32, got {values.dtype}")
     if values.shape[-1] % _A5_FP32_VECTOR_LANES != 0:
-        message = f"A5 FP32 TROWSUM width must be divisible by {_A5_FP32_VECTOR_LANES}, got {values.shape[-1]}"
+        message = (
+            f"A5 FP32 TROWSUM width must be divisible by {_A5_FP32_VECTOR_LANES}, got {values.shape[-1]}"
+        )
         raise ValueError(message)
 
     # Reduce 64-lane groups pairwise, then accumulate the group sums in address order.
@@ -718,7 +821,7 @@ def _golden_a5_trowsum_fp32(values):
     group_sums = groups[..., 0]
     total = torch.zeros_like(group_sums[..., :1])
     for group in range(group_sums.shape[-1]):
-        total += group_sums[..., group:group + 1]
+        total += group_sums[..., group : group + 1]
     return total
 
 
@@ -740,7 +843,7 @@ def _golden_a5_rms_inv(x_flat_2d):
 
     sq_sum = torch.zeros(x_flat_2d.shape[0], 1, dtype=torch.float32, device=x_flat_2d.device)
     for k0 in range(0, HC_DIM, RMS_K_TILE):
-        x_chunk = x_flat_2d[:, k0:k0 + RMS_K_TILE]
+        x_chunk = x_flat_2d[:, k0 : k0 + RMS_K_TILE]
         sq_sum += _golden_a5_trowsum_fp32(x_chunk * x_chunk)
 
     rms_arg = sq_sum * HC_DIM_INV + NORM_EPS
@@ -779,9 +882,9 @@ def golden_hc_pre(tensors):
     mixes *= rsqrt
 
     pre = torch.sigmoid(mixes[..., :HC_MULT] * hc_scale[0] + hc_base[:HC_MULT]) + HC_EPS
-    post_logits = mixes[..., HC_MULT:HC_MULT * 2] * hc_scale[1] + hc_base[HC_MULT:HC_MULT * 2]
+    post_logits = mixes[..., HC_MULT : HC_MULT * 2] * hc_scale[1] + hc_base[HC_MULT : HC_MULT * 2]
     post_t = 2 * torch.sigmoid(post_logits)
-    comb_logits = mixes[..., HC_MULT * 2:] * hc_scale[2] + hc_base[HC_MULT * 2:]
+    comb_logits = mixes[..., HC_MULT * 2 :] * hc_scale[2] + hc_base[HC_MULT * 2 :]
     comb_t = comb_logits.view(t_dim, HC_MULT, HC_MULT)
 
     comb_t = torch.softmax(comb_t, dim=-1) + HC_EPS
@@ -819,12 +922,30 @@ def build_tensor_specs(B, S):
     def init_hc_base():
         return torch.tensor(
             [
-                5.9166, -3.6223, -2.9324, -3.3124,
-                -3.9100, -0.9384, -3.3256, -2.5240,
-                2.0706, -2.5728, 0.1424, -3.9453,
-                -3.8859, 3.4634, -3.3799, -2.6077,
-                -2.7191, -2.4846, 2.0395, -0.5010,
-                -3.5992, -2.7520, -3.3493, 3.1587,
+                5.9166,
+                -3.6223,
+                -2.9324,
+                -3.3124,
+                -3.9100,
+                -0.9384,
+                -3.3256,
+                -2.5240,
+                2.0706,
+                -2.5728,
+                0.1424,
+                -3.9453,
+                -3.8859,
+                3.4634,
+                -3.3799,
+                -2.6077,
+                -2.7191,
+                -2.4846,
+                2.0395,
+                -0.5010,
+                -3.5992,
+                -2.7520,
+                -3.3493,
+                3.1587,
             ]
         )
 
@@ -849,7 +970,9 @@ if __name__ == "__main__":
     }
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument(
+        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
+    )
     parser.add_argument("-d", "--device", type=int, default=0)
     mode_help = "Use decode or prefill batch sizes, or 'all' to test both."
     parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all", help=mode_help)

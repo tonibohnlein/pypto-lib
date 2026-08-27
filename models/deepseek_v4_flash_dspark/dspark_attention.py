@@ -42,7 +42,7 @@ KV_T_DYN = pl.dynamic("DSPARK_ATTENTION_KV_T_DYN")
 
 # model config
 B = DECODE_BATCH // TP
-S = DSPARK_SPEC_TOKENS                   # anchor-first draft query rows per request
+S = DSPARK_SPEC_TOKENS  # anchor-first draft query rows per request
 T = B * S
 D = M.hidden_size
 H = M.num_attention_heads
@@ -59,20 +59,86 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 O_LORA_DIM = O_GROUPS * O_LORA
 MAX_SEQ_LEN = M.max_position_embeddings
 SOFTMAX_SCALE = M.softmax_scale
-VISIBLE_ROWS = WIN + S                   # trailing window + whole draft block
+VISIBLE_ROWS = WIN + S  # trailing window + whole draft block
 
 # tiling
 ATTN_K_TILE = 64
 SPARSE_BLOCKS = (VISIBLE_ROWS + ATTN_K_TILE - 1) // ATTN_K_TILE
 INDEX_WIDTH = SPARSE_BLOCKS * ATTN_K_TILE
-BIAS_B_TILE = 8                          # 2 request blocks
-H_TILE = 16                              # 4 head blocks
+BIAS_B_TILE = 8  # 2 request blocks
+H_TILE = 16  # 4 head blocks
 MATMUL_T_TILE = 16
 PROJ_N_TILE = 128
 PROJ_K_TILE = 512
 QUANT_T_TILE = 8
-QUANT_K_TILE = 512                       # 16 steps over O_LORA_DIM
+QUANT_K_TILE = 512  # 16 steps over O_LORA_DIM
 NEG_INF = -1.0e20
+
+
+@pl.jit.inline
+def dspark_o_lora_quant(
+    o_lora: pl.Tensor[[T, O_LORA_DIM], pl.BF16],
+    o_lora_i8: pl.Tensor[[T, O_LORA_DIM], pl.INT8],
+    o_lora_scale: pl.Tensor[[T, 1], pl.FP32],
+):
+    """Quantize the DSpark output LoRA activation per token."""
+    for quant_idx in pl.spmd(T // QUANT_T_TILE, name_hint="dspark_o_lora_quant"):
+        quant_t0 = quant_idx * QUANT_T_TILE
+        o_amax = pl.full([1, QUANT_T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        for amax_k0 in pl.pipeline(0, O_LORA_DIM, QUANT_K_TILE, stage=2):
+            amax_chunk = pl.cast(
+                o_lora[quant_t0 : quant_t0 + QUANT_T_TILE, amax_k0 : amax_k0 + QUANT_K_TILE],
+                target_type=pl.FP32,
+            )
+            amax_row = pl.reshape(pl.row_max(pl.abs(amax_chunk)), [1, QUANT_T_TILE])
+            o_amax = pl.maximum(o_amax, amax_row)
+        quant_max = pl.full([1, QUANT_T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
+        o_scale_q = pl.div(quant_max, o_amax)
+        o_lora_scale[quant_t0 : quant_t0 + QUANT_T_TILE, 0:1] = pl.reshape(
+            pl.recip(o_scale_q), [QUANT_T_TILE, 1]
+        )
+        o_scale_q_col = pl.reshape(o_scale_q, [QUANT_T_TILE, 1])
+        for quant_k0 in pl.pipeline(0, O_LORA_DIM, QUANT_K_TILE, stage=2):
+            quant_chunk = pl.cast(
+                o_lora[quant_t0 : quant_t0 + QUANT_T_TILE, quant_k0 : quant_k0 + QUANT_K_TILE],
+                target_type=pl.FP32,
+            )
+            quant_scaled = pl.row_expand_mul(quant_chunk, o_scale_q_col)
+            quant_i32 = pl.cast(quant_scaled, target_type=pl.INT32, mode="rint")
+            quant_fp16 = pl.cast(quant_i32, target_type=pl.FP16, mode="round")
+            o_lora_i8[quant_t0 : quant_t0 + QUANT_T_TILE, quant_k0 : quant_k0 + QUANT_K_TILE] = pl.cast(
+                quant_fp16, target_type=pl.INT8, mode="trunc"
+            )
+
+
+@pl.jit.inline
+def dspark_kv_commit_valid_bias(
+    kv: pl.Tensor[[KV_T_DYN, HEAD_DIM], pl.BF16],
+    kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    kv_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
+    swa_lens: pl.Tensor[[B], pl.INT32],
+    sparse_bias: pl.Tensor[[B, INDEX_WIDTH], pl.FP32],
+):
+    """Commit projected KV rows and build the sparse-attention validity bias."""
+    kv_tokens = pl.tensor.dim(kv, 0)
+    ori_block_num = pl.tensor.dim(kv_cache, 0)
+    kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_kv_commit_valid_bias"):
+        for write_t in pl.range(kv_tokens):
+            write_row_i64 = pl.read(kv_slot_mapping, [write_t])
+            if write_row_i64 >= 0:
+                write_row = pl.cast(write_row_i64, pl.INDEX)
+                kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
+        v_col = pl.cast(pl.arange(0, [1, INDEX_WIDTH], dtype=pl.INT32), target_type=pl.FP32)
+        for v_blk in pl.range(B // BIAS_B_TILE):
+            v_b0 = v_blk * BIAS_B_TILE
+            v_col_m = pl.col_expand(pl.full([BIAS_B_TILE, INDEX_WIDTH], dtype=pl.FP32, value=0.0), v_col)
+            v_lens = pl.cast(
+                pl.reshape(swa_lens[v_b0 : v_b0 + BIAS_B_TILE], [BIAS_B_TILE, 1]),
+                target_type=pl.FP32,
+            )
+            v_valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0), 1.0)
+            sparse_bias[v_b0 : v_b0 + BIAS_B_TILE, 0:INDEX_WIDTH] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
 
 
 @pl.jit.inline
@@ -104,12 +170,8 @@ def dspark_attention(
     rope_sin_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
     for rope_t in pl.spmd(T, name_hint="dspark_q_rope_rows"):
         rope_position = pl.cast(pl.read(position_ids, [rope_t]), pl.INDEX)
-        rope_cos_t[rope_t : rope_t + 1, :] = freqs_cos[
-            rope_position : rope_position + 1, :
-        ]
-        rope_sin_t[rope_t : rope_t + 1, :] = freqs_sin[
-            rope_position : rope_position + 1, :
-        ]
+        rope_cos_t[rope_t : rope_t + 1, :] = freqs_cos[rope_position : rope_position + 1, :]
+        rope_sin_t[rope_t : rope_t + 1, :] = freqs_sin[rope_position : rope_position + 1, :]
 
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
@@ -120,9 +182,17 @@ def dspark_attention(
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     q_proj_rope(
-        x, wq_a, wq_b, wq_b_scale, gamma_cq,
-        rope_cos_il, rope_sin_signed, rope_swap_idx,
-        q, qr, qr_scale,
+        x,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        gamma_cq,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+        q,
+        qr,
+        qr_scale,
     )
 
     kv_rope_cos_t = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.BF16)
@@ -161,22 +231,10 @@ def dspark_attention(
 
     # Commit the block's own KV and build the visible-length mask in one task; the
     # gather below reads those rows back through swa_indices.
+    sparse_bias = pl.create_tensor([B, INDEX_WIDTH], dtype=pl.FP32)
+    dspark_kv_commit_valid_bias(kv, kv_cache, kv_slot_mapping, swa_lens, sparse_bias)
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    sparse_bias = pl.create_tensor([B, INDEX_WIDTH], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_kv_commit_valid_bias"):
-        for write_t in pl.range(kv_tokens):
-            write_row_i64 = pl.read(kv_slot_mapping, [write_t])
-            if write_row_i64 >= 0:
-                write_row = pl.cast(write_row_i64, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
-        v_col = pl.cast(pl.arange(0, [1, INDEX_WIDTH], dtype=pl.INT32), target_type=pl.FP32)
-        for v_blk in pl.range(B // BIAS_B_TILE):
-            v_b0 = v_blk * BIAS_B_TILE
-            v_col_m = pl.col_expand(pl.full([BIAS_B_TILE, INDEX_WIDTH], dtype=pl.FP32, value=0.0), v_col)
-            v_lens = pl.cast(pl.reshape(swa_lens[v_b0 : v_b0 + BIAS_B_TILE], [BIAS_B_TILE, 1]), target_type=pl.FP32)
-            v_valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0), 1.0)
-            sparse_bias[v_b0 : v_b0 + BIAS_B_TILE, 0:INDEX_WIDTH] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
 
     # One index row per request: build_dspark_swa_indices repeats it across the
     # block's query rows, so the gather runs B times, not T.
@@ -269,8 +327,12 @@ def dspark_attention(
         inverse_odd_cos = pl.col_expand_mul(rope_odd, cos_fp32)
         inverse_odd = pl.sub(inverse_odd_cos, inverse_even_sin)
         inverse_rope = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-        inverse_rope = pl.tensor.scatter(inverse_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=inverse_rope)
-        inverse_rope = pl.tensor.scatter(inverse_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=inverse_rope)
+        inverse_rope = pl.tensor.scatter(
+            inverse_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=inverse_rope
+        )
+        inverse_rope = pl.tensor.scatter(
+            inverse_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=inverse_rope
+        )
         inverse_rope_bf16 = pl.cast(inverse_rope, target_type=pl.BF16, mode="rint")
         output_row = merge_q_row + merge_head0
         attn_heads_flat[output_row : output_row + H_TILE, 0:NOPE_DIM] = attn_nope
@@ -294,8 +356,12 @@ def dspark_attention(
         proj_a_acc = pl.matmul(proj_a_input0, proj_a_weight0, b_trans=True, out_dtype=pl.FP32)
         for proj_a_k0 in pl.pipeline(PROJ_K_TILE, O_GROUP_IN, PROJ_K_TILE, stage=2):
             proj_a_input_k0 = input_col + proj_a_k0
-            proj_a_input_k = attn_flat[t0 : t0 + MATMUL_T_TILE, proj_a_input_k0 : proj_a_input_k0 + PROJ_K_TILE]
-            proj_a_weight_k = wo_a_flat[weight_row : weight_row + PROJ_N_TILE, proj_a_k0 : proj_a_k0 + PROJ_K_TILE]
+            proj_a_input_k = attn_flat[
+                t0 : t0 + MATMUL_T_TILE, proj_a_input_k0 : proj_a_input_k0 + PROJ_K_TILE
+            ]
+            proj_a_weight_k = wo_a_flat[
+                weight_row : weight_row + PROJ_N_TILE, proj_a_k0 : proj_a_k0 + PROJ_K_TILE
+            ]
             proj_a_acc = pl.matmul_acc(proj_a_acc, proj_a_input_k, proj_a_weight_k, b_trans=True)
         proj_a_bf16 = pl.cast(proj_a_acc, target_type=pl.BF16, mode="rint")
         o_lora[t0 : t0 + MATMUL_T_TILE, weight_row : weight_row + PROJ_N_TILE] = proj_a_bf16
@@ -303,31 +369,7 @@ def dspark_attention(
     # W8A8 output projection: per-token activation quant against per-channel wo_b.
     o_lora_i8 = pl.create_tensor([T, O_LORA_DIM], dtype=pl.INT8)
     o_lora_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    for quant_idx in pl.spmd(T // QUANT_T_TILE, name_hint="dspark_o_lora_quant"):
-        quant_t0 = quant_idx * QUANT_T_TILE
-        o_amax = pl.full([1, QUANT_T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        for amax_k0 in pl.pipeline(0, O_LORA_DIM, QUANT_K_TILE, stage=2):
-            amax_chunk = pl.cast(
-                o_lora[quant_t0 : quant_t0 + QUANT_T_TILE, amax_k0 : amax_k0 + QUANT_K_TILE], target_type=pl.FP32
-            )
-            amax_row = pl.reshape(pl.row_max(pl.abs(amax_chunk)), [1, QUANT_T_TILE])
-            o_amax = pl.maximum(o_amax, amax_row)
-        quant_max = pl.full([1, QUANT_T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
-        o_scale_q = pl.div(quant_max, o_amax)
-        o_lora_scale[quant_t0 : quant_t0 + QUANT_T_TILE, 0:1] = pl.reshape(
-            pl.recip(o_scale_q), [QUANT_T_TILE, 1]
-        )
-        o_scale_q_col = pl.reshape(o_scale_q, [QUANT_T_TILE, 1])
-        for quant_k0 in pl.pipeline(0, O_LORA_DIM, QUANT_K_TILE, stage=2):
-            quant_chunk = pl.cast(
-                o_lora[quant_t0 : quant_t0 + QUANT_T_TILE, quant_k0 : quant_k0 + QUANT_K_TILE], target_type=pl.FP32
-            )
-            quant_scaled = pl.row_expand_mul(quant_chunk, o_scale_q_col)
-            quant_i32 = pl.cast(quant_scaled, target_type=pl.INT32, mode="rint")
-            quant_fp16 = pl.cast(quant_i32, target_type=pl.FP16, mode="round")
-            o_lora_i8[quant_t0 : quant_t0 + QUANT_T_TILE, quant_k0 : quant_k0 + QUANT_K_TILE] = pl.cast(
-                quant_fp16, target_type=pl.INT8, mode="trunc"
-            )
+    dspark_o_lora_quant(o_lora, o_lora_i8, o_lora_scale)
 
     for proj_b_idx in pl.spmd((T // MATMUL_T_TILE) * (D // PROJ_N_TILE), name_hint="dspark_wo_b"):
         t0 = (proj_b_idx // (D // PROJ_N_TILE)) * MATMUL_T_TILE
@@ -377,10 +419,24 @@ def dspark_attention_test(
     return dspark_attention(
         x,
         x,
-        wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, position_ids, position_ids,
-        kv_cache, slot_mapping, swa_indices, swa_lens,
-        attn_sink, wo_a, wo_b, wo_b_scale,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        gamma_cq,
+        gamma_ckv,
+        freqs_cos,
+        freqs_sin,
+        position_ids,
+        position_ids,
+        kv_cache,
+        slot_mapping,
+        swa_indices,
+        swa_lens,
+        attn_sink,
+        wo_a,
+        wo_b,
+        wo_b_scale,
         x_out,
     )
 
@@ -398,21 +454,23 @@ def golden_dspark_attention(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
-    golden_qkv_proj_rope({
-        "x": tensors["x"],
-        "wq_a": tensors["wq_a"],
-        "wq_b": tensors["wq_b"],
-        "wq_b_scale": tensors["wq_b_scale"],
-        "wkv": tensors["wkv"],
-        "rope_cos": rope_cos,
-        "rope_sin": rope_sin,
-        "gamma_cq": tensors["gamma_cq"],
-        "gamma_ckv": tensors["gamma_ckv"],
-        "q": q,
-        "kv": kv,
-        "qr": qr,
-        "qr_scale": qr_scale,
-    })
+    golden_qkv_proj_rope(
+        {
+            "x": tensors["x"],
+            "wq_a": tensors["wq_a"],
+            "wq_b": tensors["wq_b"],
+            "wq_b_scale": tensors["wq_b_scale"],
+            "wkv": tensors["wkv"],
+            "rope_cos": rope_cos,
+            "rope_sin": rope_sin,
+            "gamma_cq": tensors["gamma_cq"],
+            "gamma_ckv": tensors["gamma_ckv"],
+            "q": q,
+            "kv": kv,
+            "qr": qr,
+            "qr_scale": qr_scale,
+        }
+    )
 
     kv_cache_flat = tensors["kv_cache"].view(-1, HEAD_DIM)
     slots = tensors["slot_mapping"]
@@ -489,9 +547,13 @@ def build_tensor_specs(start_pos=None):
         return position_ids_from_starts(init_start_pos(), seq=S).reshape(-1).contiguous()
 
     def init_slot_mapping():
-        return paged_slot_mapping(
-            position_ids_from_starts(init_start_pos(), seq=S), init_block_table(), block_size=BLOCK_SIZE
-        ).reshape(-1).contiguous()
+        return (
+            paged_slot_mapping(
+                position_ids_from_starts(init_start_pos(), seq=S), init_block_table(), block_size=BLOCK_SIZE
+            )
+            .reshape(-1)
+            .contiguous()
+        )
 
     def init_swa_metadata():
         # build_dspark_swa_indices: window start clamped at 0, visible = window + block.
@@ -521,18 +583,18 @@ def build_tensor_specs(start_pos=None):
         return torch.randn(T, D, dtype=torch.bfloat16) * 0.05
 
     def init_wq_a():
-        return (torch.randn(D, Q_LORA) / D ** 0.5).to(torch.bfloat16)
+        return (torch.randn(D, Q_LORA) / D**0.5).to(torch.bfloat16)
 
     def init_wkv():
-        return (torch.randn(D, HEAD_DIM) / D ** 0.5).to(torch.bfloat16)
+        return (torch.randn(D, HEAD_DIM) / D**0.5).to(torch.bfloat16)
 
     def init_wo_a():
-        return (torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5).to(torch.bfloat16)
+        return (torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN**0.5).to(torch.bfloat16)
 
-    wq_b_bf16 = (torch.randn(Q_LORA, H * HEAD_DIM) / Q_LORA ** 0.5).to(torch.bfloat16)
+    wq_b_bf16 = (torch.randn(Q_LORA, H * HEAD_DIM) / Q_LORA**0.5).to(torch.bfloat16)
     wq_b_i8, wq_b_scale = quant_w_per_channel(wq_b_bf16.t().contiguous())
     wq_b_i8 = wq_b_i8.t().contiguous()
-    wo_b_bf16 = (torch.randn(D, O_LORA_DIM) / O_LORA_DIM ** 0.5).to(torch.bfloat16)
+    wo_b_bf16 = (torch.randn(D, O_LORA_DIM) / O_LORA_DIM**0.5).to(torch.bfloat16)
     wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
 
     return [
@@ -543,8 +605,12 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=lambda: torch.ones(Q_LORA)),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=lambda: torch.ones(HEAD_DIM)),
-        TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=lambda: freqs_cos.clone()),
-        TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=lambda: freqs_sin.clone()),
+        TensorSpec(
+            "freqs_cos", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=lambda: freqs_cos.clone()
+        ),
+        TensorSpec(
+            "freqs_sin", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=lambda: freqs_sin.clone()
+        ),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
         TensorSpec(
             "kv_cache",
@@ -569,10 +635,14 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 DSpark drafter attention validation.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument(
+        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
+    )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--start-pos", type=int, default=None)
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
+    parser.add_argument(
+        "--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4)
+    )
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
