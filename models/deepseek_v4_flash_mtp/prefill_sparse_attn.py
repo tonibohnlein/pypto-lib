@@ -378,6 +378,47 @@ def sparse_attn_math(
     return attn_out
 
 
+@pl.jit.inline(auto_scope=False)
+def build_sparse_bias(
+    swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
+    sparse_bias: pl.Out[pl.Tensor[[T, PREFILL_SPARSE_PAD], pl.FP32]],
+):
+    """Materialize the sparse-attention mask used by the production prefill path."""
+    with pl.spmd(T // BIAS_TOKEN_TILE, name_hint="build_bias"):
+        bias_blk = pl.tile.get_block_idx()
+        bias_t0 = bias_blk * BIAS_TOKEN_TILE
+        bias_win_rows = swa_indices[bias_t0 : bias_t0 + BIAS_TOKEN_TILE, 0:WIN]
+        bias_win_idx = pl.cast(bias_win_rows, target_type=pl.FP32)
+        bias_win_raw_flag = pl.minimum(pl.maximum(pl.add(bias_win_idx, 1.0), 0.0), 1.0)
+        bias_win = pl.mul(pl.sub(bias_win_raw_flag, 1.0), -FP32_NEG_INF)
+        sparse_bias[bias_t0 : bias_t0 + BIAS_TOKEN_TILE, 0:WIN] = bias_win
+        if SPARSE_CMP_BIAS_COLS > 0:
+            bias_cmp_rows = cmp_indices[
+                bias_t0 : bias_t0 + BIAS_TOKEN_TILE,
+                0:SPARSE_CMP_BIAS_COLS,
+            ]
+            bias_cmp_idx = pl.cast(bias_cmp_rows, target_type=pl.FP32)
+            bias_cmp_raw_flag = pl.minimum(pl.maximum(pl.add(bias_cmp_idx, 1.0), 0.0), 1.0)
+            bias_cmp = pl.mul(pl.sub(bias_cmp_raw_flag, 1.0), -FP32_NEG_INF)
+            sparse_bias[
+                bias_t0 : bias_t0 + BIAS_TOKEN_TILE,
+                WIN:SPARSE_BIAS_COLS,
+            ] = bias_cmp
+        if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
+            bias_pad_cols = PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS
+            bias_pad = pl.full(
+                [BIAS_TOKEN_TILE, bias_pad_cols],
+                dtype=pl.FP32,
+                value=FP32_NEG_INF,
+            )
+            sparse_bias[
+                bias_t0 : bias_t0 + BIAS_TOKEN_TILE,
+                SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD,
+            ] = bias_pad
+    return sparse_bias
+
+
 @pl.jit.inline
 def sparse_attn(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
@@ -455,24 +496,7 @@ def sparse_attn(
                                     stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[src:src + 1, :]
                         sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
 
-    with pl.spmd(T // BIAS_TOKEN_TILE, name_hint="build_bias") as bias_tid:
-        bias_blk = pl.tile.get_block_idx()
-        bias_t0 = bias_blk * BIAS_TOKEN_TILE
-        bias_win_rows = swa_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN]
-        bias_win_idx = pl.cast(bias_win_rows, target_type=pl.FP32)
-        bias_win_raw_flag = pl.minimum(pl.maximum(pl.add(bias_win_idx, 1.0), 0.0), 1.0)
-        bias_win = pl.mul(pl.sub(bias_win_raw_flag, 1.0), -FP32_NEG_INF)
-        sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN] = bias_win
-        if SPARSE_CMP_BIAS_COLS > 0:
-            bias_cmp_rows = cmp_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:SPARSE_CMP_BIAS_COLS]
-            bias_cmp_idx = pl.cast(bias_cmp_rows, target_type=pl.FP32)
-            bias_cmp_raw_flag = pl.minimum(pl.maximum(pl.add(bias_cmp_idx, 1.0), 0.0), 1.0)
-            bias_cmp = pl.mul(pl.sub(bias_cmp_raw_flag, 1.0), -FP32_NEG_INF)
-            sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, WIN:SPARSE_BIAS_COLS] = bias_cmp
-        if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
-            bias_pad_cols = PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS
-            bias_pad = pl.full([BIAS_TOKEN_TILE, bias_pad_cols], dtype=pl.FP32, value=FP32_NEG_INF)
-            sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD] = bias_pad
+    build_sparse_bias(swa_indices, cmp_indices, sparse_bias)
 
     return sparse_attn_math(
         q,
