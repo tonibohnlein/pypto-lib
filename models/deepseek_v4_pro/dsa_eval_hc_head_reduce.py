@@ -105,13 +105,13 @@ def build_tensor_specs():
             torch.float32,
             init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124]),
         ),
-        TensorSpec("y", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("y", [T, D], torch.bfloat16),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -119,12 +119,11 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true")
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=hc_head_reduce_test,
         specs=build_tensor_specs(),
         golden_fn=golden_hc_head_reduce,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(platform=args.platform, device_id=args.device),
+        config=dict(dump_passes=args.dump_passes, platform=args.platform, device_id=args.device),
         rtol=1e-3,
         atol=1e-3,
         compare_fn={"y": ratio_allclose(atol=1e-4, rtol=1.0 / 128)},

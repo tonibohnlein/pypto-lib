@@ -23,13 +23,14 @@ from sample import (
 
 @pl.jit
 def gumbel_argmax_test(
+    logits: pl.Tensor[[SAMPLE_ROWS, VOCAB], pl.FP32],
     filtered_logits: pl.Tensor[[SAMPLE_ROWS, VOCAB], pl.FP32],
     temperatures: pl.Tensor[[SAMPLE_ROWS], pl.FP32],
     seeds: pl.Tensor[[SAMPLE_ROWS], pl.INT32],
     positions: pl.Tensor[[SAMPLE_ROWS], pl.INT32],
     sampled_ids: pl.Out[pl.Tensor[[SAMPLE_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
 ):
-    return gumbel_sample(filtered_logits, temperatures, seeds, positions, sampled_ids)
+    return gumbel_sample(logits, filtered_logits, temperatures, seeds, positions, sampled_ids)
 
 
 def golden_gumbel_argmax(tensors):
@@ -37,8 +38,10 @@ def golden_gumbel_argmax(tensors):
 
     tensors["sampled_ids"].zero_()
     for row in range(SAMPLE_ROWS):
-        scores = tensors["filtered_logits"][row].float()
-        if float(tensors["temperatures"][row]) >= SAMPLING_EPS:
+        if float(tensors["temperatures"][row]) < SAMPLING_EPS:
+            scores = tensors["logits"][row].float()
+        else:
+            scores = tensors["filtered_logits"][row].float()
             seed = int(tensors["seeds"][row])
             position = int(tensors["positions"][row])
             scores = scores + torch.from_numpy(_gumbel_noise(seed, position))
@@ -63,6 +66,17 @@ def build_tensor_specs():
 
     return [
         TensorSpec(
+            "logits",
+            [SAMPLE_ROWS, VOCAB],
+            torch.float32,
+            init_value=lambda: torch.randn(
+                SAMPLE_ROWS,
+                VOCAB,
+                generator=torch.Generator().manual_seed(20260906),
+                dtype=torch.float32,
+            ),
+        ),
+        TensorSpec(
             "filtered_logits",
             [SAMPLE_ROWS, VOCAB],
             torch.float32,
@@ -86,13 +100,13 @@ def build_tensor_specs():
             torch.int32,
             init_value=lambda: repeat_rows([0, 1, 17, 1024], torch.int32),
         ),
-        TensorSpec("sampled_ids", [SAMPLE_ROWS, SAMPLED_IDS_PAD], torch.int32, is_output=True),
+        TensorSpec("sampled_ids", [SAMPLE_ROWS, SAMPLED_IDS_PAD], torch.int32),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -100,12 +114,11 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true")
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=gumbel_argmax_test,
         specs=build_tensor_specs(),
         golden_fn=golden_gumbel_argmax,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(platform=args.platform, device_id=args.device),
+        config=dict(dump_passes=args.dump_passes, platform=args.platform, device_id=args.device),
         rtol=0,
         atol=0,
     )

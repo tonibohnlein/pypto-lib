@@ -61,7 +61,6 @@ def build_tensor_specs():
             [KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=lambda: torch.zeros(KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16),
-            is_output=True,
         ),
         TensorSpec(
             "kv_slot_mapping", [T], torch.int64, init_value=lambda: torch.arange(T, dtype=torch.int64)
@@ -72,13 +71,13 @@ def build_tensor_specs():
             torch.int32,
             init_value=lambda: torch.linspace(1, INDEX_WIDTH, B, dtype=torch.float32).to(torch.int32),
         ),
-        TensorSpec("sparse_bias", [B, INDEX_WIDTH], torch.float32, is_output=True),
+        TensorSpec("sparse_bias", [B, INDEX_WIDTH], torch.float32),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -86,12 +85,11 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true")
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=kv_commit_valid_bias_test,
         specs=build_tensor_specs(),
         golden_fn=golden_kv_commit_valid_bias,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(platform=args.platform, device_id=args.device),
+        config=dict(dump_passes=args.dump_passes, platform=args.platform, device_id=args.device),
         rtol=0,
         atol=0,
     )

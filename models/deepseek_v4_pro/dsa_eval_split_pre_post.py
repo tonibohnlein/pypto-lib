@@ -75,14 +75,14 @@ def build_tensor_specs():
         TensorSpec("mixes_partials", [PARTIAL_ROWS, MIX_PAD], torch.float32, init_value=lambda: partials),
         TensorSpec("hc_scale", [3], torch.float32, init_value=lambda: hc_scale),
         TensorSpec("hc_base", [MIX_HC], torch.float32, init_value=lambda: hc_base),
-        TensorSpec("pre_val", [T, HC_PAD], torch.float32, is_output=True),
-        TensorSpec("post", [T, HC_MULT], torch.float32, is_output=True),
+        TensorSpec("pre_val", [T, HC_PAD], torch.float32),
+        TensorSpec("post", [T, HC_MULT], torch.float32),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -90,12 +90,11 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true")
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=split_pre_post_test,
         specs=build_tensor_specs(),
         golden_fn=golden_split_pre_post,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(platform=args.platform, device_id=args.device),
+        config=dict(dump_passes=args.dump_passes, platform=args.platform, device_id=args.device),
         rtol=1e-4,
         atol=1e-5,
     )

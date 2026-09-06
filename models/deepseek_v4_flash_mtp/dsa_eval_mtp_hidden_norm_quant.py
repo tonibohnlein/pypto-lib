@@ -50,14 +50,14 @@ def build_tensor_specs():
         TensorSpec("hidden_states", [T, D], torch.bfloat16, init_value=lambda: torch.randn(T, D)),
         TensorSpec("enorm_w", [D], torch.float32, init_value=lambda: torch.randn(D) * 0.1 + 1.0),
         TensorSpec("e_proj_smooth", [D], torch.float32, init_value=lambda: torch.randn(D) * 0.05 + 1.0),
-        TensorSpec("hidden_i8", [T, D], torch.int8, is_output=True),
-        TensorSpec("hidden_scale_dq", [T, 1], torch.float32, is_output=True),
+        TensorSpec("hidden_i8", [T, D], torch.int8),
+        TensorSpec("hidden_scale_dq", [T, 1], torch.float32),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -65,12 +65,11 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true")
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=mtp_hidden_norm_quant_test,
         specs=build_tensor_specs(),
         golden_fn=golden_mtp_hidden_norm_quant,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(platform=args.platform, device_id=args.device),
+        config=dict(dump_passes=args.dump_passes, platform=args.platform, device_id=args.device),
         rtol=1e-4,
         atol=1e-5,
     )

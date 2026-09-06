@@ -51,19 +51,18 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--dump-passes", action="store_true")
     args = parser.parse_args()
-    result = run_jit(
+    result = run(
         fn=hc_post_prefill_test,
         specs=build_tensor_specs(),
         golden_fn=golden_hc_post_prefill,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(platform=args.platform, device_id=args.device),
+        config=dict(dump_passes=args.dump_passes, platform=args.platform, device_id=args.device),
         rtol=1e-3,
         atol=1e-3,
     )

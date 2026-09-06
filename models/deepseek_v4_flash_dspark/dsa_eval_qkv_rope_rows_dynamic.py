@@ -58,14 +58,14 @@ def build_tensor_specs():
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=lambda: init_table(0.0)),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=lambda: init_table(1.0)),
         TensorSpec("position_ids", [T], torch.int32, init_value=lambda: positions.clone()),
-        TensorSpec("rope_cos_t", [T, ROPE_DIM], torch.bfloat16, is_output=True),
-        TensorSpec("rope_sin_t", [T, ROPE_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("rope_cos_t", [T, ROPE_DIM], torch.bfloat16),
+        TensorSpec("rope_sin_t", [T, ROPE_DIM], torch.bfloat16),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -73,12 +73,11 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true")
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=qkv_rope_rows_dynamic_test,
         specs=build_tensor_specs(),
         golden_fn=golden_qkv_rope_rows_dynamic,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(platform=args.platform, device_id=args.device),
+        config=dict(dump_passes=args.dump_passes, platform=args.platform, device_id=args.device),
         rtol=0,
         atol=0,
     )
