@@ -333,12 +333,35 @@ def build_prefill_runtime_args(
     v_cache: Any,
     logits: Any,
 ) -> tuple[Any, ...]:
-    """Build arguments in qwen3_prefill_host signature order."""
+    """Build arguments in qwen3_prefill_host signature order.
+
+    Validate sequence and chunk lengths when both tensors are host-resident.
+    Callers supplying device tensors must validate their metadata before launch.
+    """
+    import torch
+
+    seq_lens = inputs.seq_lens
+    chunk_lens = inputs.chunk_lens
+    if (
+        isinstance(seq_lens, torch.Tensor)
+        and isinstance(chunk_lens, torch.Tensor)
+        and seq_lens.device.type == "cpu"
+        and chunk_lens.device.type == "cpu"
+    ):
+        if seq_lens.ndim != 1 or seq_lens.shape != chunk_lens.shape:
+            raise ValueError("Qwen3-14B prefill lengths must be one-dimensional tensors of the same size.")
+        for b, (seq_len, chunk_len) in enumerate(zip(seq_lens.tolist(), chunk_lens.tolist(), strict=True)):
+            if not 0 <= chunk_len <= seq_len <= QWEN3_14B.max_seq:
+                raise ValueError(
+                    f"Qwen3-14B prefill row {b} requires 0 <= chunk_len <= seq_len <= {QWEN3_14B.max_seq}, "
+                    f"got chunk_len={chunk_len} and seq_len={seq_len}."
+                )
+
     weights = static.decode_weights
     return (
         inputs.token_ids,
-        inputs.seq_lens,
-        inputs.chunk_lens,
+        seq_lens,
+        chunk_lens,
         inputs.chunk_offsets,
         weights["decode_input_rms_weight"],
         weights["decode_wq"],

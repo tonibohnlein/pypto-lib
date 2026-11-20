@@ -457,7 +457,8 @@ def test_prefill_and_greedy_sample_stay_capped_at_pad(batch: int) -> None:
             contract.kernels[stage].compile_args_builder(_tiny_model_config(), runtime)
 
 
-def test_runtime_arg_builders_follow_host_order() -> None:
+@pytest.mark.parametrize("host_lengths", [False, True])
+def test_runtime_arg_builders_follow_host_order(host_lengths: bool) -> None:
     contract = get_contract("qwen3", "14b")
     static = SimpleNamespace(
         decode_weights={
@@ -481,8 +482,8 @@ def test_runtime_arg_builders_follow_host_order() -> None:
     )
     prefill_inputs = SimpleNamespace(
         token_ids="token_ids",
-        seq_lens="seq_lens",
-        chunk_lens="chunk_lens",
+        seq_lens=torch.tensor([0, 128, 129], dtype=torch.int32) if host_lengths else "seq_lens",
+        chunk_lens=torch.tensor([0, 128, 128], dtype=torch.int32) if host_lengths else "chunk_lens",
         chunk_offsets="chunk_offsets",
         block_table="block_table",
         slot_mapping="slot_mapping",
@@ -511,10 +512,32 @@ def test_runtime_arg_builders_follow_host_order() -> None:
         next_hidden_buffer="next_hidden",
     )
 
-    assert prefill_args[:6] == ("token_ids", "seq_lens", "chunk_lens", "chunk_offsets", "input_rms_weight", "wq")
+    assert prefill_args[0] == "token_ids"
+    assert prefill_args[1] is prefill_inputs.seq_lens
+    assert prefill_args[2] is prefill_inputs.chunk_lens
+    assert prefill_args[3:6] == ("chunk_offsets", "input_rms_weight", "wq")
     assert prefill_args[-5:] == ("post_rms_weight", "final_norm_weight", "lm_head", "embed", "logits")
     assert decode_args[:4] == ("input_rms_weight", "wq", "wk", "wv")
     assert decode_args[-5:] == ("logits", "embed", "token_ids", "sampled_ids", "next_hidden")
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "chunk_len"),
+    [
+        (127, 128),
+        (128, -1),
+        (2**31 - 1, 128),
+        (-(2**31), 2**31 - 1),
+    ],
+)
+def test_prefill_runtime_args_reject_invalid_host_lengths(seq_len: int, chunk_len: int) -> None:
+    prefill = get_contract("qwen3", "14b").kernels["prefill"]
+    inputs = SimpleNamespace(
+        seq_lens=torch.tensor([128, seq_len], dtype=torch.int32),
+        chunk_lens=torch.tensor([128, chunk_len], dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="prefill row 1 requires"):
+        prefill.runtime_args_builder(inputs, SimpleNamespace(), k_cache=None, v_cache=None, logits=None)
 
 
 def test_prepare_weights_rejects_oversized_lm_head_vocab() -> None:

@@ -26,6 +26,9 @@ token ids and slot mapping as packed token-major tensors with leading dim
 gathered on device before the first transformer layer. `seq_lens`
 stores the absolute sequence length after the current chunk; `chunk_lens`
 and `chunk_offsets` identify each batch row's slice inside the packed chunk.
+Raw tensor callers must supply `0 <= chunk_lens[b] <= seq_lens[b] <= MAX_SEQ`
+and valid packed offsets and cache mappings. Host-build-graph callers must
+provide host copies of the packed chunk lengths and offsets with matching values.
 
 Unlike the decode path, prefill bounds hidden-state lifetime by processing
 128-token windows. Batch-1 uses a compact `[128, HIDDEN]` window so it does
@@ -104,6 +107,7 @@ ATTN_TOK_GROUP = 8
 ATTN_GI_GROUP = 1
 FINALIZE_SPMD_BLOCKS = 48
 FINALIZE_TOK_GROUP = TOK_TILE
+FULL_GROUP_FITS_BLOCK = FINALIZE_TOK_GROUP <= SEQ_TILE and FINALIZE_TOK_GROUP % ATTN_TOK_GROUP == 0
 Q_HEAD_BATCH_PAD = 16
 ATTN_GI_SCORE_ROWS = ATTN_TOK_GROUP * ATTN_GI_GROUP * Q_HEAD_PAD
 ATTN_GI_STAT_ROWS = ATTN_TOK_GROUP * ATTN_GI_GROUP * Q_HEAD_BATCH_PAD
@@ -544,8 +548,6 @@ def _attention_phase_window_full_single_block(
     b: pl.Scalar[pl.INT32],
     max_blocks_per_seq: pl.Scalar[pl.INT32],
     layer_cache_base: pl.Scalar[pl.INT32],
-    chunk_start: pl.Scalar[pl.INT32],
-    p0: pl.Scalar[pl.INT32],
     final_ti0: pl.Scalar[pl.INT32],
     rope_ready_deps: pl.Array[ROPE_READY_DEP_COUNT, pl.TASK_ID],
 ) -> tuple[
@@ -569,7 +571,7 @@ def _attention_phase_window_full_single_block(
             micro_id = work_id // ATTN_GI_BLOCKS
             gi_block = work_id - micro_id * ATTN_GI_BLOCKS
             gi = gi_block * ATTN_GI_GROUP
-            attn_ti0 = final_ti0 + micro_id * ATTN_TOK_GROUP
+            attn_dt0 = micro_id * ATTN_TOK_GROUP
             kvh = gi // Q_GROUPS
             block_table_idx = b * max_blocks_per_seq
             pbid = pl.cast(
@@ -581,7 +583,8 @@ def _attention_phase_window_full_single_block(
             k_tile = pl.slice(k_cache_bsnd, [SEQ_TILE, HEAD_DIM], [cache_row0, cache_col])
             v_tile = pl.slice(v_cache_bsnd, [SEQ_TILE, HEAD_DIM], [cache_row0, cache_col])
             for dd0 in pl.pipeline(0, ATTN_TOK_GROUP, QKPV_PIPELINE_TOK_STEP, stage=3):
-                ti0 = attn_ti0 + dd0
+                rel_ti0 = attn_dt0 + dd0
+                ti0 = final_ti0 + rel_ti0
                 q_row0 = ti0 * TOTAL_Q_GROUPS * Q_HEAD_PAD + gi * Q_HEAD_PAD
                 q0 = pl.slice(
                     all_q_padded_tile,
@@ -595,8 +598,7 @@ def _attention_phase_window_full_single_block(
                     out_dtype=pl.FP32,
                 )
 
-                chunk_pos0 = p0 + ti0
-                ctx_len0 = chunk_start + chunk_pos0 + 1
+                ctx_len0 = rel_ti0 + 1
                 scores0 = pl.fillpad(
                     pl.set_validshape(
                         pl.mul(raw_scores0, ATTN_SCALE),
@@ -1019,16 +1021,18 @@ def prefill_layer(
         token_base = pl.cast(b * MLP_M_TILE, pl.INDEX)
         seq_len_b = pl.tensor.read(seq_lens, [b])
         full_chunk_len_b = pl.tensor.read(host_chunk_lens, [b])
-        group_p0_i32 = pl.cast(group_p0, pl.INT32)
-        chunk_start = seq_len_b - full_chunk_len_b
-        remaining_tok = full_chunk_len_b - group_p0_i32
-        chunk_len_b = pl.min(MLP_M_TILE, pl.max(remaining_tok, 0))
+        chunk_start_wide = pl.cast(seq_len_b, pl.INT64) - pl.cast(full_chunk_len_b, pl.INT64)
+        chunk_bounds_valid = full_chunk_len_b >= 0 and chunk_start_wide >= 0 and seq_len_b <= MAX_SEQ
+        remaining_tok = pl.cast(full_chunk_len_b, pl.INT64) - pl.cast(group_p0, pl.INT64)
+        chunk_len_b = pl.cast(pl.min(MLP_M_TILE, pl.max(remaining_tok, 0)), pl.INT32)
         tok_blocks = (chunk_len_b + TOK_TILE - 1) // TOK_TILE
         kv_tail_idx = pl.cast(layer_idx, pl.INDEX) * BATCH_PAD + b
         for p0_idx in pl.unroll(MLP_M_TILE // TOK_TILE):
             post_norm_tid_for_ready = pl.system.task_invalid()
-            if p0_idx < tok_blocks:
+            if chunk_bounds_valid and p0_idx < tok_blocks:
                 with pl.scope():
+                    chunk_start = pl.cast(chunk_start_wide, pl.INT32)
+                    group_p0_i32 = pl.cast(group_p0, pl.INT32)
                     p0 = p0_idx * TOK_TILE
                     token_p0 = token_base + p0
                     slot_token_p0 = original_token_base + p0
@@ -1170,8 +1174,8 @@ def prefill_layer(
 
                             cur_li_phase = pl.create_tensor([ATTN_PHASE_ACC_STAT_ROWS, 1], dtype=pl.FP32)
                             oi_tmp_phase = pl.create_tensor([ATTN_PHASE_ACC_SCORE_ROWS, HEAD_DIM], dtype=pl.FP32)
-                            block_ctx_len = chunk_start + group_p0_i32 + p0 + final_ti0 + finalize_tok
-                            block_ctx_blocks = (block_ctx_len + SEQ_TILE - 1) // SEQ_TILE
+                            window_offset = pl.cast(group_p0 + p0 + final_ti0, pl.INT64)
+                            first_pos = chunk_start_wide + window_offset
                             pl.array.update_element(fused_qkpv_deps, 4, rope_ready_deps[0])
                             all_q_padded_tile = _manual_rope_kv_cache_phase(
                                 all_q_padded_tile,
@@ -1197,59 +1201,18 @@ def prefill_layer(
                                 fused_qkpv_deps,
                                 rope_ready_deps,
                             )
-                            if block_ctx_blocks == 1:
-                                if finalize_tok == FINALIZE_TOK_GROUP:
-                                    attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window_full_single_block(
-                                        attn_tile,
-                                        all_q_padded_tile,
-                                        block_table,
-                                        k_cache,
-                                        v_cache,
-                                        cur_li_phase,
-                                        oi_tmp_phase,
-                                        b_i32,
-                                        max_blocks_i32,
-                                        layer_cache_base_i32,
-                                        chunk_start,
-                                        p0_i32,
-                                        final_ti0_i32,
-                                        rope_ready_deps,
-                                    )
-                                else:
-                                    attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window(
-                                        attn_tile,
-                                        all_q_padded_tile,
-                                        block_table,
-                                        k_cache,
-                                        v_cache,
-                                        cur_li_phase,
-                                        oi_tmp_phase,
-                                        b_i32,
-                                        max_blocks_i32,
-                                        layer_cache_base_i32,
-                                        chunk_start,
-                                        p0_i32,
-                                        final_ti0_i32,
-                                        finalize_tok_i32,
-                                        rope_ready_deps,
-                                    )
+                            if FULL_GROUP_FITS_BLOCK and first_pos == 0 and finalize_tok == FINALIZE_TOK_GROUP:
+                                attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window_full_single_block(
+                                    attn_tile, all_q_padded_tile, block_table, k_cache, v_cache,
+                                    cur_li_phase, oi_tmp_phase,
+                                    b_i32, max_blocks_i32, layer_cache_base_i32, final_ti0_i32, rope_ready_deps,
+                                )
                             else:
                                 attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window(
-                                    attn_tile,
-                                    all_q_padded_tile,
-                                    block_table,
-                                    k_cache,
-                                    v_cache,
-                                    cur_li_phase,
-                                    oi_tmp_phase,
-                                    b_i32,
-                                    max_blocks_i32,
-                                    layer_cache_base_i32,
-                                    chunk_start,
-                                    p0_i32,
-                                    final_ti0_i32,
-                                    finalize_tok_i32,
-                                    rope_ready_deps,
+                                    attn_tile, all_q_padded_tile, block_table, k_cache, v_cache,
+                                    cur_li_phase, oi_tmp_phase,
+                                    b_i32, max_blocks_i32, layer_cache_base_i32,
+                                    chunk_start, p0_i32, final_ti0_i32, finalize_tok_i32, rope_ready_deps,
                                 )
                     resid1_tile = pl.slice(resid1_mtile, [TOK_TILE, HIDDEN], [p0, 0])
                     out_proj_tile = _out_proj_aic_phase(
@@ -1330,7 +1293,7 @@ def prefill_layer(
                     post_norm_tid_for_ready = post_norm_tid
             post_norm_tids[p0_idx] = post_norm_tid_for_ready
 
-        if tok_blocks > 0:
+        if chunk_bounds_valid and tok_blocks > 0:
             # Consume this m-tile immediately after its attention/post-norm tile
             # finishes. Keeping the MLP consumer close to the ring3
             # attention producers lets the ring reclaim older tile scopes before the
