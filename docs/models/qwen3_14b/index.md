@@ -114,6 +114,9 @@ and [topk_select.py](../../../models/qwen3_14b/topk_select.py) are the standalon
 sampling components; `decode_fwd` inlines its own greedy sample so a step
 produces the next token without a host round trip.
 
+The inline sampler reduces only the real vocabulary prefix. It loads a
+shorter final chunk and keeps the lowest token ID when scores tie.
+
 ### Serving glue
 
 [weights.py](../../../models/qwen3_14b/weights.py) prepares the kernel-ready

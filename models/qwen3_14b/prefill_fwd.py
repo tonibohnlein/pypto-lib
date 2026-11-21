@@ -308,8 +308,10 @@ def _attention_phase_window(
                                             chunk_pos = p0 + ti
                                             pos = chunk_start + chunk_pos
                                             ctx_len = pos + 1
-                                            ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                                            if sb < ctx_blocks:
+                                            # A causal page contributes only its positive intersection with the prefix.
+                                            s0 = sb * SEQ_TILE
+                                            valid_len = pl.min(SEQ_TILE, ctx_len - s0)
+                                            if valid_len > 0:
                                                 q_row0 = ti * TOTAL_Q_GROUPS * Q_HEAD_PAD + gi * Q_HEAD_PAD
                                                 q_padded = pl.slice(
                                                     all_q_padded_tile,
@@ -322,8 +324,6 @@ def _attention_phase_window(
                                                     b_trans=True,
                                                     out_dtype=pl.FP32,
                                                 )
-                                                s0 = sb * SEQ_TILE
-                                                valid_len = pl.min(SEQ_TILE, ctx_len - s0)
                                                 scores = pl.fillpad(
                                                     pl.set_validshape(
                                                         pl.mul(raw_scores, ATTN_SCALE),
@@ -739,30 +739,37 @@ def _rope_kv_cache_phase(
                 ti0 = final_ti0 + rel_ti0
                 group_tok = pl.min(ROPE_T_GROUP, finalize_tok - rel_ti0)
                 pos0 = chunk_start + p0 + ti0
-                cos_lo_g = pl.slice(
+                cos_lo_active = pl.slice(
                     rope_cos,
                     [ROPE_T_GROUP, HALF_DIM],
                     [pos0, 0],
                     valid_shape=[group_tok, HALF_DIM],
                 )
-                cos_hi_g = pl.slice(
+                cos_hi_active = pl.slice(
                     rope_cos,
                     [ROPE_T_GROUP, HALF_DIM],
                     [pos0, HALF_DIM],
                     valid_shape=[group_tok, HALF_DIM],
                 )
-                sin_lo_g = pl.slice(
+                sin_lo_active = pl.slice(
                     rope_sin,
                     [ROPE_T_GROUP, HALF_DIM],
                     [pos0, 0],
                     valid_shape=[group_tok, HALF_DIM],
                 )
-                sin_hi_g = pl.slice(
+                sin_hi_active = pl.slice(
                     rope_sin,
                     [ROPE_T_GROUP, HALF_DIM],
                     [pos0, HALF_DIM],
                     valid_shape=[group_tok, HALF_DIM],
                 )
+                # Rotation is row-local and cache writes are guarded by group_tok.
+                # Materialize a full coefficient tile without reading beyond the
+                # available RoPE positions, including at the end of the table.
+                cos_lo_g = pl.fillpad(cos_lo_active, pad_value=pl.PadValue.zero)
+                cos_hi_g = pl.fillpad(cos_hi_active, pad_value=pl.PadValue.zero)
+                sin_lo_g = pl.fillpad(sin_lo_active, pad_value=pl.PadValue.zero)
+                sin_hi_g = pl.fillpad(sin_hi_active, pad_value=pl.PadValue.zero)
                 input_inv_rms_g = pl.slice(input_inv_rms_tile, [ROPE_T_GROUP, 1], [ti0, 0])
                 k_norm_g = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
                 q_norm_g = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
@@ -1095,8 +1102,11 @@ def prefill_layer(
                                         ),
                                         target_type=pl.FP32,
                                     )
+                                    # The reciprocal tile is read in fixed-size groups. A padded
+                                    # token contributes zero to the full-width sum of squares.
+                                    rms_x_padded = pl.fillpad(rms_x_chunk, pad_value=pl.PadValue.zero)
                                     sq_part = pl.reshape(
-                                        pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk)),
+                                        pl.row_sum(pl.mul(rms_x_padded, rms_x_padded)),
                                         [1, RMSNORM_TOK_GROUP],
                                     )
                                     sq_sum = pl.add(sq_sum, sq_part)
@@ -1238,7 +1248,10 @@ def prefill_layer(
                                 target_type=pl.FP32,
                             )
                             out_proj_chunk = pl.slice(out_proj_tile, [TOK_TILE, OUT_RESID_CHUNK], [0, o0])
-                            resid1_tile = pl.assemble(resid1_tile, pl.add(out_proj_chunk, resid_chunk), [0, o0])
+                            # The MLP seed reads the whole residual tile. Missing hidden-state
+                            # rows contribute zero, without reading beyond the packed input.
+                            resid_padded = pl.fillpad(resid_chunk, pad_value=pl.PadValue.zero)
+                            resid1_tile = pl.assemble(resid1_tile, pl.add(out_proj_chunk, resid_padded), [0, o0])
 
                     post_norm_tile = pl.slice(post_norm_mtile, [TOK_TILE, HIDDEN], [p0, 0])
                     # Keep post_norm fully resolved before MLP opens its ring3

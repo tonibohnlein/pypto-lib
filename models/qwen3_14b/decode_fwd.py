@@ -87,6 +87,7 @@ EMBED_HIDDEN_CHUNK = 256
 SAMPLE_VOCAB_CHUNK = T.vocab_chunk
 SAMPLE_CHUNK_PAD = T.vocab_chunk
 SAMPLE_REDUCE_ROWS = 8  # Align FP32 column reductions to the A2/A3 32-byte requirement.
+SAMPLE_MIN_SCORE = -3.4028234663852886e38  # Minimum finite FP32 score.
 SAMPLE_NUM_VOCAB_CHUNKS = VOCAB // SAMPLE_VOCAB_CHUNK
 SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS = REAL_VOCAB // SAMPLE_VOCAB_CHUNK
 SAMPLE_REAL_VOCAB_TAIL = REAL_VOCAB % SAMPLE_VOCAB_CHUNK
@@ -1120,26 +1121,21 @@ def _greedy_sample_inline(
             chunk_vals = pl.tile.full(
                 [SAMPLE_REDUCE_ROWS, SAMPLE_CHUNK_PAD],
                 dtype=pl.FP32,
-                value=-3.402823e38,
+                value=SAMPLE_MIN_SCORE,
             )
             for c in pl.range(SAMPLE_REAL_NUM_VOCAB_CHUNKS):
                 c0 = c * SAMPLE_VOCAB_CHUNK
-                local_scores = pl.load(
-                    logits,
-                    [b, c0],
-                    [1, SAMPLE_VOCAB_CHUNK],
-                    target_memory=pl.MemorySpace.Vec,
-                )
-                local_valid_cols = pl.cast(SAMPLE_VOCAB_CHUNK, pl.INDEX)
-                if c == SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS:
-                    local_valid_cols = pl.cast(SAMPLE_REAL_VOCAB_TAIL, pl.INDEX)
-                local_scores_valid = pl.tile.set_validshape(local_scores, 1, local_valid_cols)
                 local_scores_rows = pl.tile.full(
                     [SAMPLE_REDUCE_ROWS, SAMPLE_VOCAB_CHUNK],
                     dtype=pl.FP32,
-                    value=-3.402823e38,
+                    value=SAMPLE_MIN_SCORE,
                 )
-                local_scores_rows = pl.tile.assemble(local_scores_rows, local_scores_valid, [0, 0])
+                if SAMPLE_REAL_VOCAB_TAIL != 0 and c == SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS:
+                    tail_scores = pl.load(logits, [b, c0], [1, SAMPLE_REAL_VOCAB_TAIL], target_memory=pl.Mem.Vec)
+                    local_scores_rows = pl.tile.assemble(local_scores_rows, tail_scores, [0, 0])
+                else:
+                    local_scores = pl.load(logits, [b, c0], [1, SAMPLE_VOCAB_CHUNK], target_memory=pl.Mem.Vec)
+                    local_scores_rows = pl.tile.assemble(local_scores_rows, local_scores, [0, 0])
                 local_max = pl.tile.row_max(local_scores_rows, reduce_tmp)
                 best_val = pl.tile.read(local_max, [0, 0])
                 pl.tile.write(chunk_vals, [0, c], best_val)
@@ -1153,38 +1149,29 @@ def _greedy_sample_inline(
                 if val == best_val:
                     chunk_i32 = pl.cast(scan_c, pl.INT32)
 
-            local_token = pl.cast(0, pl.INT32)
+            local_token = pl.cast(SAMPLE_VOCAB_CHUNK, pl.INT32)
             chunk_base = chunk_i32 * pl.cast(SAMPLE_VOCAB_CHUNK, target_type=pl.INT32)
             chunk_base_idx = pl.cast(chunk_base, target_type=pl.INDEX)
-            winning_logits = pl.load(
-                logits,
-                [pl.cast(b, pl.INDEX), chunk_base_idx],
-                [1, SAMPLE_VOCAB_CHUNK],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            if SAMPLE_REAL_VOCAB_TAIL != 0:
-                if chunk_i32 == pl.cast(SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS, target_type=pl.INT32):
-                    winning_logits_valid = pl.tile.set_validshape(winning_logits, 1, SAMPLE_REAL_VOCAB_TAIL)
-                    winning_logits_padded = pl.tile.fillpad(winning_logits_valid, pad_value=pl.PadValue.min)
-                    for t in pl.range(SAMPLE_VOCAB_CHUNK):
-                        scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
-                        val = pl.tile.read(winning_logits_padded, [0, pl.cast(scan_t, pl.INDEX)])
-                        if val == best_val:
-                            local_token = pl.cast(scan_t, pl.INT32)
-                else:
-                    for t in pl.range(SAMPLE_VOCAB_CHUNK):
-                        scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
-                        val = pl.tile.read(winning_logits, [0, pl.cast(scan_t, pl.INDEX)])
-                        if val == best_val:
-                            local_token = pl.cast(scan_t, pl.INT32)
+            if SAMPLE_REAL_VOCAB_TAIL != 0 and chunk_i32 == SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS:
+                winning_tail = pl.load(
+                    logits, [b, chunk_base_idx], [1, SAMPLE_REAL_VOCAB_TAIL], target_memory=pl.Mem.Vec
+                )
+                for t in pl.range(SAMPLE_REAL_VOCAB_TAIL):
+                    scan_t = (SAMPLE_REAL_VOCAB_TAIL - 1) - t
+                    val = pl.tile.read(winning_tail, [0, scan_t])
+                    if val == best_val:
+                        local_token = pl.cast(scan_t, pl.INT32)
             else:
+                winning_logits = pl.load(
+                    logits, [b, chunk_base_idx], [1, SAMPLE_VOCAB_CHUNK], target_memory=pl.Mem.Vec
+                )
                 for t in pl.range(SAMPLE_VOCAB_CHUNK):
                     scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
-                    val = pl.tile.read(winning_logits, [0, pl.cast(scan_t, pl.INDEX)])
+                    val = pl.tile.read(winning_logits, [0, scan_t])
                     if val == best_val:
                         local_token = pl.cast(scan_t, pl.INT32)
             token_id = chunk_base + local_token
-            if token_id >= pl.cast(REAL_VOCAB, target_type=pl.INT32):
+            if local_token == SAMPLE_VOCAB_CHUNK or token_id >= pl.cast(REAL_VOCAB, target_type=pl.INT32):
                 token_id = pl.cast(0, pl.INT32)
             token_out = pl.tile.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
             pl.tile.write(token_out, [0, 0], token_id)
