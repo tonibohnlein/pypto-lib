@@ -7,6 +7,12 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pypto
 import pytest
 
 from models.deepseek_v4_flash_mtp import config
@@ -53,3 +59,34 @@ def test_deepseek_v4_flash_prefill_padding_rejects_non_integer_extents(
 def test_deepseek_v4_flash_contract_matches_kernel_prefill_shape() -> None:
     assert config.PREFILL_BATCH == CONTRACT.max_prefill_requests_per_partition
     assert config.PREFILL_SEQ == CONTRACT.prefill_tile_tokens
+
+
+@pytest.mark.skipif(getattr(pypto, "__pypto_stub__", False), reason="decode_fwd.py imports PyPTO kernels")
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--auto-qkv-input-layout", "wq_a", "--runtime-dir", "."], "requires a fresh compile"),
+        (["--steady-state"], "requires --auto-qkv-input-layout"),
+        (["--auto-qkv-input-layout", "wq_a", "--expected-weight-uses", "1000", "--steady-state"],
+         "not allowed with argument"),
+    ],
+)
+def test_decode_forward_rejects_invalid_layout_options(arguments: list[str], message: str) -> None:
+    repo = Path(__file__).resolve().parents[2]
+    driver = repo / "models" / "deepseek_v4_flash_mtp" / "decode_fwd.py"
+    search_paths = [str(repo)]
+    if os.environ.get("PYTHONPATH"):
+        search_paths.append(os.environ["PYTHONPATH"])
+    result = subprocess.run(
+        [
+            sys.executable, str(driver), "--ep", "2", "--tp", "2",
+            *arguments,
+        ],
+        cwd=repo,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(search_paths)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 2, result.stderr
+    assert message in result.stderr

@@ -52,6 +52,13 @@ result = run(
 - `save_data` defaults to `False`; ordinary validation remains in memory and
   does not create a snapshot.
 
+If a read-only matrix weight declares `TensorSpec.input_layout`, the snapshot
+records its initializer's layout in `data/input_layouts.json`. For a
+compiler-selected resident input (a whole matrix on worker 0 or a rank-stacked bank), replay uses that source layout and
+the target layout recorded in the compiled artifact. Keep the layout file
+with the saved tensors. Matching tensor shapes alone cannot distinguish ND
+and NZ bytes.
+
 If the kernel CLI should expose this behavior, wire both options directly:
 
 ```python

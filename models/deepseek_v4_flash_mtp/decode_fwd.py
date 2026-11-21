@@ -144,6 +144,8 @@ HCA_LAYER_STACKED_NAMES = [
     "hca_cmp_kv",
 ]
 
+QKV_WEIGHT_NAMES = ("wq_a", "wq_b", "wkv")
+
 # The attention weights that stacked their layers on the row axis. NZ cannot
 # address a row window, so on this branch they stack on a new leading axis and a
 # layer is an index; wo_a already stacked that way (its groups lead).
@@ -1322,6 +1324,8 @@ def build_single_layer_tensor_specs(
     hca_state_block_num=HCA_COMPRESS_STATE_BLOCK_NUM,
     csa_state_block_num=CSA_MAIN_STATE_BLOCK_NUM,
     inner_state_block_num=CSA_INNER_STATE_BLOCK_NUM,
+    *,
+    logical_qkv_weights=(),
 ):
     """Per-layer single-rank tensor specs: the base shapes/dtypes/inits that
     build_tensor_specs restacks across the 43 forward layers."""
@@ -1343,7 +1347,7 @@ def build_single_layer_tensor_specs(
 
     swa_specs = {
         spec.name: spec
-        for spec in build_attention_tensor_specs(start_pos)
+        for spec in build_attention_tensor_specs(start_pos, logical_qkv_weights=logical_qkv_weights)
         if isinstance(spec, TensorSpec)
     }
     hca_specs = {
@@ -1614,6 +1618,8 @@ def build_tensor_specs(
     hca_state_block_num=HCA_COMPRESS_STATE_BLOCK_NUM,
     csa_state_block_num=CSA_MAIN_STATE_BLOCK_NUM,
     inner_state_block_num=CSA_INNER_STATE_BLOCK_NUM,
+    *,
+    logical_qkv_weights=(),
 ):
     import torch
     from golden import TensorSpec
@@ -1640,6 +1646,7 @@ def build_tensor_specs(
             hca_state_block_num=hca_state_block_num,
             csa_state_block_num=csa_state_block_num,
             inner_state_block_num=inner_state_block_num,
+            logical_qkv_weights=logical_qkv_weights,
         )
         if isinstance(spec, TensorSpec)
     }
@@ -1687,6 +1694,8 @@ def build_tensor_specs(
     for spec in specs:
         if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in CACHE_POOL_NAMES:
             spec.resident = "stacked"
+        if spec.name in QKV_WEIGHT_NAMES:
+            spec.input_layout = "ND" if spec.name in logical_qkv_weights else "NZ"
 
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32))
     specs.append(TensorSpec(
@@ -1773,7 +1782,18 @@ def main():
                         help="Replay a prior run's data/in instead of regenerating inputs; "
                              "requires an unchanged spec set.")
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--auto-qkv-input-layout", nargs="+", choices=QKV_WEIGHT_NAMES, default=(),
+                        help="Offer ND and NZ for the named resident QKV weights.")
+    objective = parser.add_mutually_exclusive_group()
+    objective.add_argument("--expected-weight-uses", type=int, default=100,
+                           help="Number of forwards sharing one prepared QKV weight bank (default 100).")
+    objective.add_argument("--steady-state", action="store_true",
+                           help="Optimize resident forwards with the selected QKV weights already prepared.")
     args = parser.parse_args()
+    if args.steady_state and not args.auto_qkv_input_layout:
+        parser.error("--steady-state requires --auto-qkv-input-layout")
+    if args.runtime_dir is not None and args.auto_qkv_input_layout:
+        parser.error("--auto-qkv-input-layout requires a fresh compile and cannot be used with --runtime-dir")
     if args.execution_mode:
         parser.error("this entry requires hardware; --sim is unsupported")
     assert args.tp <= args.ep, f"decode_fwd device lm_head requires --tp <= --ep, got tp={args.tp}, ep={args.ep}"
@@ -1788,6 +1808,21 @@ def main():
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
+    layout_config = {}
+    logical_qkv_weights = ()
+    if args.auto_qkv_input_layout:
+        from pypto.ir import InputLayoutPolicy, OptimizationStrategy
+
+        logical_qkv_weights = tuple(dict.fromkeys(args.auto_qkv_input_layout))
+        layout_config = dict(
+            strategy=OptimizationStrategy.AutoLayoutIntermediates,
+            input_layout_policy=InputLayoutPolicy(
+                nz_inputs=logical_qkv_weights, reusable_tensors=logical_qkv_weights,
+                expected_uses=1 if args.steady_state else args.expected_weight_uses,
+                steady_state=args.steady_state,
+            ),
+        )
+
     specs = build_tensor_specs(
         start_pos=parse_start_pos_arg(args.start_pos),
         num_tokens=args.num_tokens,
@@ -1797,6 +1832,7 @@ def main():
         hca_state_block_num=args.hca_state_block_num,
         csa_state_block_num=args.csa_state_block_num,
         inner_state_block_num=args.inner_state_block_num,
+        logical_qkv_weights=logical_qkv_weights,
     )
 
     result = run(
@@ -1814,6 +1850,7 @@ def main():
             execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
+            **layout_config,
         ),
     )
     if not result.passed:

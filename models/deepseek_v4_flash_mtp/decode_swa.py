@@ -256,7 +256,7 @@ def golden_attention_swa(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos=None):
+def build_tensor_specs(start_pos=None, *, logical_qkv_weights=()):
     import torch  # type: ignore[import]
     from utils import (
         pack_nz,
@@ -269,6 +269,9 @@ def build_tensor_specs(start_pos=None):
         token_local_rope,
     )
     from golden import TensorSpec
+
+    def qkv_weight(name, logical):
+        return logical if name in logical_qkv_weights else pack_nz(logical)
 
     def quant_w_per_output_channel(w):
         amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
@@ -383,10 +386,10 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
         TensorSpec("attn_norm_w", [D], torch.bfloat16, init_value=init_attn_norm_w),
-        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=lambda: pack_nz(init_wq_a().to(torch.bfloat16))),
-        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: pack_nz(wq_b_i8)),
+        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=lambda: qkv_weight("wq_a", init_wq_a().bfloat16())),
+        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: qkv_weight("wq_b", wq_b_i8)),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
-        TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=lambda: pack_nz(init_wkv().to(torch.bfloat16))),
+        TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=lambda: qkv_weight("wkv", init_wkv().bfloat16())),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=init_gamma_cq),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [T, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),

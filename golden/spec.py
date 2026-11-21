@@ -77,6 +77,9 @@ class TensorSpec:
               each rank's slice must reside on the card that consumes it.
 
             ``True`` is rejected as ambiguous — pass an int worker id instead.
+        input_layout: Byte layout of an immutable matrix weight's initializer
+            (``"ND"`` or ``"NZ"``). The harness records this in the saved input
+            snapshot. Compiler-selected layouts are read from the artifact.
         direction: ``"in"`` / ``"out"`` / ``"inout"``, stamped by the harness
             from the compiled artifact's ``ParamDirection`` before any tensor is
             allocated. Not an init argument: the kernel signature owns the
@@ -96,9 +99,13 @@ class TensorSpec:
     dtype: torch.dtype
     init_value: int | float | torch.Tensor | Callable | None = field(default=None)
     resident: int | str | bool | None = None
+    input_layout: str | None = field(default=None, kw_only=True)
     direction: str | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.input_layout not in (None, "ND", "NZ"):
+            raise ValueError(f"TensorSpec {self.name!r}: input_layout must be 'ND' or 'NZ'")
+
         # Validate the ``resident`` mode. A resident output is allowed:
         # a read-write resident state buffer (e.g. a KV cache) uploaded once,
         # updated in place on-device across dispatches, and read back once at the

@@ -14,6 +14,7 @@ so they run without a device.
 """
 
 import ctypes
+import json
 import sys
 import types
 from contextlib import contextmanager
@@ -2606,6 +2607,111 @@ class TestResidentPath:
 
         assert r.passed, f"unexpected failure: {r.error}"
         l3res.assert_called_once()
+
+    @pytest.mark.parametrize("source_layout", ["ND", "NZ"])
+    @pytest.mark.parametrize("resident", ["stacked", 0])
+    def test_selected_layout_prepares_before_fork_and_reuses_handle(
+        self, build_dir, monkeypatch, source_layout, resident,
+    ):
+        shape = (2, 3, 16, 32) if resident == "stacked" else (16, 32)
+        logical = torch.arange(torch.Size(shape).numel(), dtype=torch.int16).reshape(shape)
+        # An asymmetric bank with separate rank/layer matrices and two C0 blocks.
+        source = logical if source_layout == "ND" else torch.cat(
+            [logical[..., :16].flatten(-2), logical[..., 16:].flatten(-2)], dim=-1,
+        ).reshape_as(logical)
+        scale = torch.linspace(0.01, 0.25, 6 * 32).reshape(2, 3, 32)
+        specs = [
+            TensorSpec("w", list(source.shape), source.dtype, init_value=source,
+                       resident=resident, input_layout=source_layout),
+            TensorSpec("scale", list(scale.shape), scale.dtype, init_value=scale, resident="stacked"),
+            TensorSpec("out", [1], torch.float32),
+        ]
+        data_dir = build_dir / "data"
+        if source_layout == "NZ":
+            # A reloaded artifact consumes a prior authored snapshot with distinct
+            # layout provenance. Its current fixture defaults need not match.
+            _save_tensors(data_dir / "in", {"w": source, "scale": scale})
+            _save_tensors(data_dir / "out", {"out": torch.zeros(1)})
+            (data_dir / "input_layouts.json").write_text('{"w": "NZ"}')
+            specs[0].input_layout = "ND"
+
+        ops = []
+        rt = _ResidentRT(stacked_handle=object())
+        token = object()
+        selected_handle = object()
+
+        def _alloc_input(compiled, slot, init):
+            assert compiled is dcp
+            assert (slot, init) == (0, token)
+            ops.append("upload")
+            return selected_handle
+
+        rt.alloc_input_tensor = _alloc_input
+
+        class _LayoutDCP:
+            output_dir = build_dir
+            input_layouts = {0: types.SimpleNamespace(layout="NZ")}
+
+            def _get_metadata(self):
+                directions = (_FakeParamDirection.In, _FakeParamDirection.In, _FakeParamDirection.Out)
+                return ([
+                    _l3_info(s.name, shape=s.shape, dtype=s.dtype, direction=direction)
+                    for s, direction in zip(specs, directions, strict=True)
+                ], None, None)
+
+            def prepare_input(self, slot, tensor, *, source_layout, shared):
+                ops.append("pack")
+                assert slot == 0 and shared
+                assert source_layout == ("ND" if tensor is logical else "NZ")
+                assert torch.equal(tensor, source)
+                return token
+
+            def prepare(self, _cfg, *, inherited_host_tensors, **_kwargs):
+                ops.append("fork")
+                assert inherited_host_tensors == [token]
+                return rt
+
+        dcp = _LayoutDCP()
+
+        def _golden(tensors):
+            ops.append("golden")
+            assert torch.equal(tensors["w"], logical)
+            assert torch.equal(tensors["scale"], scale)
+
+        monkeypatch.setenv("PYPTO_BENCH", "1")
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "2")
+        monkeypatch.setenv("PYPTO_BENCH_WARMUP", "1")
+        with (
+            _l3_abi_environment(),
+            patch.dict(sys.modules, _resident_modules(
+                _LayoutDCP,
+                bench_capture=_NullCapture,
+                parse_stats=lambda *_a, **_k: types.SimpleNamespace(host_wall_us=[]),
+            )),
+            patch("pypto.ir.compile", return_value=dcp),
+            patch("golden.runner._reload_from_dir", return_value=dcp),
+            patch("golden.runner._setup_runtime_dir", return_value=build_dir),
+        ):
+            replay = source_layout == "NZ"
+            result = run(
+                fn=object(), specs=specs, golden_fn=_golden, save_data=True,
+                runtime_dir=str(build_dir) if replay else None,
+                golden_data=str(data_dir) if replay else None,
+            )
+
+        assert result.passed, result.error
+        expected_ops = ["pack", "fork", "upload"] if replay else ["golden", "pack", "fork", "upload"]
+        assert ops == expected_ops
+        free = "free_stacked" if resident == "stacked" else "free"
+        assert rt.kinds() == ["alloc_stacked", "dispatch", "dispatch", "dispatch", free, "free_stacked"]
+        if resident == "stacked":
+            assert rt.payloads(free)[0] is selected_handle
+        else:
+            assert rt.payloads(free) == [(selected_handle, 0)]
+        assert all(args[0] is selected_handle for args, _cfg in rt.payloads("dispatch"))
+        assert torch.equal(rt.payloads("alloc_stacked")[0][2], scale)
+        assert json.loads((data_dir / "input_layouts.json").read_text()) == {"w": source_layout}
+        assert torch.equal(torch.load(data_dir / "in" / "w.pt", weights_only=True), source)
 
     def test_runtime_dir_resident_enables_embedded_benchmark(self, tmp_path, monkeypatch):
         prebuilt = tmp_path / "prebuilt"

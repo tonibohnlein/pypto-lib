@@ -12,6 +12,7 @@
 Public entry point: :func:`run`.
 """
 
+import json
 import os
 import re
 import statistics
@@ -26,6 +27,8 @@ import torch
 
 from .spec import ScalarSpec, TensorSpec
 from .validation import validate_golden
+
+_INPUT_LAYOUTS_FILE = "input_layouts.json"
 
 
 @dataclass
@@ -381,12 +384,18 @@ def _prepare_inputs(
         tensors = {spec.name: spec.create_tensor() for spec in tensor_specs}
         scalar_specs_eff = _effective_scalar_specs(scalar_specs, data_dir)
         if save_data:
-            in_dir = work_dir / "data" / "in"
+            saved_data_dir = work_dir / "data"
+            in_dir = saved_data_dir / "in"
+            layout_file = saved_data_dir / _INPUT_LAYOUTS_FILE
+            layout_file.unlink(missing_ok=True)
             _save_tensors(
                 in_dir,
                 {s.name: tensors[s.name] for s in tensor_specs if s.is_input},
             )
             _save_tensors(in_dir, {s.name: s.value for s in scalar_specs})
+            layouts = {s.name: s.input_layout for s in tensor_specs if s.input_layout is not None}
+            if layouts:
+                layout_file.write_text(json.dumps(layouts, sort_keys=True) + "\n")
         return tensors, scalar_specs_eff
 
     required = [
@@ -894,7 +903,7 @@ def _run_benchmark_l3(
     )
 
 
-def _share_in_place(tensors: dict[str, torch.Tensor]) -> None:
+def _share_in_place(tensors: dict[str, torch.Tensor], *, exclude: Iterable[str] = ()) -> None:
     """Make every tensor shared-memory in place (required by the prepared L3 worker).
 
     A prepared :class:`~pypto.runtime.distributed_runner.DistributedWorker` reads
@@ -903,10 +912,11 @@ def _share_in_place(tensors: dict[str, torch.Tensor]) -> None:
     contiguous and ``share_memory_()`` *before* the fork. Replaces any
     non-contiguous / non-shared tensor with a contiguous shared copy in the same
     dict, so the caller's later :func:`_validate` reads the device-written
-    outputs back from these same buffers.
+    outputs back from these same buffers. Excluded tensors have a separate
+    prepared shared upload source.
     """
     for name, t in list(tensors.items()):
-        if t.is_shared() and t.is_contiguous():
+        if name in exclude or (t.is_shared() and t.is_contiguous()):
             continue
         tensors[name] = t.cpu().contiguous().share_memory_()
 
@@ -1142,6 +1152,8 @@ def _run_l3_resident(
     atol: float,
     compare_fn: dict[str, Callable],
     benchmark_enabled: bool | None = None,
+    *,
+    input_layout_sources: dict[int, str] | None = None,
 ) -> Any:
     """Dispatch an L3 program keeping resident weights device-resident.
 
@@ -1179,8 +1191,15 @@ def _run_l3_resident(
             "(a @pl.jit.host kernel compiled with distributed_config)."
         )
 
-    # Per-call IO + resident upload sources must be shared memory before prepare().
-    _share_in_place(tensors)
+    prepared_inputs = {
+        specs[slot].name: (
+            slot,
+            compiled.prepare_input(slot, tensors[specs[slot].name], source_layout=layout, shared=True),
+        )
+        for slot, layout in (input_layout_sources or {}).items()
+    }
+    # Per-call IO and the remaining resident upload sources must be shared before prepare().
+    _share_in_place(tensors, exclude=prepared_inputs)
 
     pure_out_names = _l3_pure_out_names(compiled)
     run_config = cfg
@@ -1205,21 +1224,30 @@ def _run_l3_resident(
         # Benchmarks model serving's steady-state dispatch: retain CommDomains
         # across rounds and let kernels clear their own signal windows. Keep the
         # ordinary validation path one-shot.
+        prepare_kwargs = (
+            {"inherited_host_tensors": [token for _, token in prepared_inputs.values()]}
+            if prepared_inputs else {}
+        )
         if bench:
             prepared = compiled.prepare(
                 run_config,
                 persistent=True,
                 reset_persistent_windows=False,
+                **prepare_kwargs,
             )
         else:
-            prepared = compiled.prepare()
+            prepared = compiled.prepare(**prepare_kwargs)
         with prepared as rt:
             # (name, handle, is_stacked, worker_id) — is_stacked picks the matching
             # free below; worker_id is the card a whole-tensor buffer was allocated on.
             resident_handles: list[tuple[str, Any, bool, int]] = []
             try:
                 for s in resident_specs:
-                    if s.resident == "stacked":
+                    if s.name in prepared_inputs:
+                        slot, token = prepared_inputs[s.name]
+                        handle = rt.alloc_input_tensor(compiled, slot, token)
+                        resident_handles.append((s.name, handle, s.resident == "stacked", 0))
+                    elif s.resident == "stacked":
                         # Leading-dim sharded: shard i of a [world_size, *tail] weight
                         # placed on card i (identity worker_ids), matching a
                         # ``for r: child(x[r], device=r)`` orchestrator.
@@ -1402,6 +1430,57 @@ def _reload_from_dir(work_dir: Path, cfg: Any) -> Any:
     )
 
 
+def _input_layout_sources(
+    compiled: Any,
+    specs: list[TensorSpec | ScalarSpec],
+    data_dir: Path | None,
+) -> dict[int, str]:
+    """Resolve initializer or snapshot layouts for compiler-selected resident inputs."""
+    selected = getattr(compiled, "input_layouts", {})
+    declared = {
+        slot: spec for slot, spec in enumerate(specs)
+        if isinstance(spec, TensorSpec) and spec.input_layout is not None
+    }
+    if not declared and not selected:
+        return {}
+
+    for slot in selected:
+        spec = declared.get(slot)
+        if spec is None or spec.direction != "in" or not spec.is_resident:
+            raise ValueError(
+                f"Layout-selectable parameter at slot {slot} requires a read-only resident TensorSpec with input_layout"
+            )
+        expected_resident = 0 if len(spec.shape) == 2 else "stacked"
+        if spec.resident != expected_resident:
+            raise ValueError(
+                f"Layout-selectable parameter {spec.name!r} requires resident={expected_resident!r}"
+            )
+
+    saved = {}
+    if data_dir is not None:
+        layout_file = data_dir / _INPUT_LAYOUTS_FILE
+        if layout_file.is_file():
+            saved = json.loads(layout_file.read_text())
+            if not isinstance(saved, dict) or any(layout not in ("ND", "NZ") for layout in saved.values()):
+                raise ValueError(f"{layout_file} must map input names to 'ND' or 'NZ'")
+
+    sources = {}
+    for slot, spec in declared.items():
+        if spec.direction != "in":
+            raise ValueError(f"TensorSpec {spec.name!r}: input_layout requires a read-only input")
+        if slot in selected:
+            source = spec.input_layout if data_dir is None else saved.get(spec.name)
+            if source is None:
+                raise ValueError(f"Missing saved layout for {spec.name!r} in {data_dir / _INPUT_LAYOUTS_FILE}")
+            sources[slot] = source
+        elif spec.name in saved and saved[spec.name] != spec.input_layout:
+            raise ValueError(
+                f"Saved layout {saved[spec.name]} for {spec.name!r} does not match "
+                f"the fixed {spec.input_layout} input contract"
+            )
+    return sources
+
+
 def _compute_golden(
     specs: list[TensorSpec | ScalarSpec],
     tensor_specs: list[TensorSpec],
@@ -1558,6 +1637,13 @@ def _run_pipeline(
     # allocating any input or letting compile-only report success.
     try:
         _validate_compiled_spec_abi(compiled, specs)
+        if runtime_dir is None:
+            policy = getattr(cfg, "input_layout_policy", None)
+            if policy is not None and _is_l3(compiled):
+                selected_names = {specs[slot].name for slot in getattr(compiled, "input_layouts", {})}
+                missing = set(policy.nz_inputs) - selected_names
+                if missing:
+                    raise ValueError(f"Compiled artifact has no input layout metadata for {sorted(missing)}")
     except ValueError as e:
         return _fail(str(e))
     if compile_only:
@@ -1577,6 +1663,7 @@ def _run_pipeline(
 
     try:
         with _Stage("generate inputs"):
+            input_layout_sources = _input_layout_sources(compiled, specs, data_dir)
             tensors, scalar_specs_eff = _prepare_inputs(
                 specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
                 require_outputs=not inputs_only_replay,
@@ -1624,6 +1711,7 @@ def _run_pipeline(
                     compiled, specs, tensors, scalar_specs_eff,
                     cfg, golden_outputs, rtol, atol, compare_fn,
                     benchmark_enabled=benchmark_enabled,
+                    input_layout_sources=input_layout_sources,
                 )
             except (AssertionError, ValueError) as e:
                 return _fail(str(e))

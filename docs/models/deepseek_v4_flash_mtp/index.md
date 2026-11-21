@@ -85,6 +85,31 @@ Each attention and each MoE stage runs in its own `pl.scope()` under
 `auto_scope=False`. The paged pools (`kv_cache`, `cmp_kv`, `idx_kv_cache`, the
 three compressor states) are passed in flat and sliced per layer.
 
+The default entry uses the authored weight layouts. With a PyPTO build that
+supports distributed input layout selection, this command compiles the same
+EP2/TP2 forward locally and offers ND and NZ for `wq_a`.
+
+```bash
+PYPTO_CODEGEN_MAX_WORKERS=1 PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+  python models/deepseek_v4_flash_mtp/decode_fwd.py -p a2a3 --ep 2 --tp 2 -d 0,1 \
+  --auto-qkv-input-layout wq_a --expected-weight-uses 100 --compile-only
+```
+
+The artifact records its choice in `distributed_meta.json`. The compiler
+keeps the leading rank and layer axes, and the loader prepares each matrix's
+selected layout before resident upload. `--expected-weight-uses` supplies the
+packing cost horizon. The CLI also accepts `wq_b` and `wkv` as offered weight
+names. Use `--steady-state` in place of `--expected-weight-uses 100` to choose
+layouts for resident forwards with their offered weights already prepared.
+
+On two Ascend devices, omit `--compile-only` to run the forward. Use
+`--save-data` to capture the inputs and `--golden-data <run>/data` to reuse
+them. Use `--auto-qkv-input-layout` when compiling and `--runtime-dir` when
+replaying an artifact with its saved layout choices. For an
+authored-versus-selected comparison, capture under the default entry first
+and reuse that snapshot with layout selection. This forward has no numerical
+golden function.
+
 ### `prefill_fwd`
 
 [prefill_fwd.py](../../../models/deepseek_v4_flash_mtp/prefill_fwd.py) mirrors
